@@ -1,9 +1,3 @@
-#!/usr/bin/env python
-# coding: utf-8
-
-# In[1]:
-
-
 import gymnasium as gym
 import torch
 import torch.nn as nn
@@ -27,7 +21,7 @@ window = 100
 
 # hyperparameters
 N_HIDDEN = 256
-EPISODES = 10000
+EPISODES = 1000
 DISCOUNT = 0.995
 # EPOCHS = 10
 BUFFER_SIZE = 50
@@ -92,7 +86,7 @@ class Agent:
             self.policy.optim.zero_grad()
             loss.backward()
             self.policy.optim.step()
-        # self.history.clear()
+        self.history.clear()
 
     # def update_value(self, val_preds, rtg):
     #     val_loss = F.mse_loss(val_preds, rtg)
