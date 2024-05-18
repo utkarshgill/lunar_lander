@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import MultivariateNormal
 import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader, TensorDataset
+
 
 # Hyperparameters
 env_name = 'LunarLanderContinuous-v2'
@@ -13,18 +15,18 @@ state_dim = 8
 action_dim = 2
 max_episodes = 5000
 max_timesteps = 3000
-update_timestep = 4000
+update_timestep = 10000
 log_interval = 20
 hidden_dim = 128
 lr = 3e-4
 gamma = 0.99
-K_epochs = 100
+K_epochs = 1
 eps_clip = 0.2
 action_std = 0.5
 gae_lambda = 0.95
 ppo_loss_coef = 1.0
 critic_loss_coef = 0.5
-entropy_coef = 0.01
+entropy_coef = 0.05
 batch_size = 32
 
 class ActorCritic(nn.Module):
@@ -101,7 +103,6 @@ class PPO:
 
         return action.detach().cpu().numpy().flatten()
 
-    
     def rtg(self, rewards, is_terms):
         out = []
         discounted_reward = 0
@@ -128,40 +129,52 @@ class PPO:
         returns = advantages + state_values[:-1]
 
         return advantages, returns
-
+    
     def update(self, memory):
-        rewards = torch.tensor(memory.rewards, dtype=torch.float32)
-        is_terms = torch.tensor(memory.is_terminals, dtype=torch.float32)
-        returns = self.rtg(memory.rewards, memory.is_terminals)
-        returns = torch.tensor(returns, dtype=torch.float32)
-
-        old_states = torch.cat(memory.states).detach()
-        old_actions = torch.cat(memory.actions).detach()
-        old_logprobs = torch.cat(memory.logprobs).detach()
-
-        for _ in range(self.K_epochs):
-            action_means, state_values = self.actor_critic(old_states)
-            action_var = torch.full((action_means.size(-1),), self.action_std**2)
-            cov_mat = torch.diag(action_var).unsqueeze(0)
-
-            dist = MultivariateNormal(action_means, covariance_matrix=cov_mat)
-            action_logprobs = dist.log_prob(old_actions)
-            dist_entropy = dist.entropy()
+        with torch.no_grad():
+            rewards = torch.tensor(memory.rewards, dtype=torch.float32)
+            is_terms = torch.tensor(memory.is_terminals, dtype=torch.float32)
+            old_states = torch.cat(memory.states).detach()
+            old_actions = torch.cat(memory.actions).detach()
+            old_logprobs = torch.cat(memory.logprobs).detach()
+            _, state_values = self.actor_critic(old_states)
             state_values = torch.squeeze(state_values)
+            advantages, returns = self.compute_advantages(rewards, state_values, is_terms)
+        
+        dataset = TensorDataset(old_states, old_actions, old_logprobs, advantages, returns)
+        dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+        
+        for _ in range(self.K_epochs):
+            for batch in dataloader:
+                batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns = batch
+                
+                # Forward pass
+                action_means, state_values = self.actor_critic(batch_states)
+                action_var = torch.full((action_means.size(-1),), self.action_std**2)
+                cov_mat = torch.diag(action_var).unsqueeze(0)
+                
+                dist = MultivariateNormal(action_means, covariance_matrix=cov_mat)
+                action_logprobs = dist.log_prob(batch_actions)
+                dist_entropy = dist.entropy()
+                state_values = torch.squeeze(state_values)
+                
+                # Compute ratios
+                ratios = torch.exp(action_logprobs - batch_logprobs.detach())
+                surr1 = ratios * batch_advantages
+                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
 
-            # advantages, returns = self.compute_advantages(rewards, state_values, is_terms)
+                # PPO loss components
+                actor_loss = -torch.min(surr1, surr2).mean()
+                critic_loss = self.mse_loss(state_values, batch_returns)
+                entropy_loss = dist_entropy.mean()
 
-            advantages = returns - state_values.detach()
+                # Total loss
+                loss = self.ppo_loss_coef * actor_loss + self.critic_loss_coef * critic_loss - self.entropy_coef * entropy_loss
 
-            ratios = torch.exp(action_logprobs - old_logprobs)
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-
-            loss = self.ppo_loss_coef * -torch.min(surr1, surr2) + self.critic_loss_coef * self.mse_loss(state_values, returns) - self.entropy_coef * dist_entropy
-
-            self.optimizer.zero_grad()
-            loss.mean().backward()
-            self.optimizer.step()
+                # Backward pass and optimizer step
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
 
 def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, lr, gamma, K_epochs, eps_clip, action_std, gae_lambda, ppo_loss_coef, critic_loss_coef, entropy_coef, batch_size):
     timestep = 0
