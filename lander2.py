@@ -5,14 +5,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import MultivariateNormal
+import matplotlib.pyplot as plt
 
 # Hyperparameters
 env_name = 'LunarLanderContinuous-v2'
 state_dim = 8
 action_dim = 2
-max_episodes = 2000
+max_episodes = 5000
 max_timesteps = 3000
-update_timestep = 5000
+update_timestep = 4000
 log_interval = 20
 hidden_dim = 128
 lr = 3e-4
@@ -22,8 +23,9 @@ eps_clip = 0.2
 action_std = 0.5
 gae_lambda = 0.95
 ppo_loss_coef = 1.0
-critic_loss_coef = 0.8
+critic_loss_coef = 0.5
 entropy_coef = 0.01
+batch_size = 32
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim):
@@ -50,71 +52,6 @@ class ActorCritic(nn.Module):
         value = self.critic_out(v)
         
         return action_mean, value
-    
-class PPO:
-    def __init__(self, actor_critic, lr, gamma, K_epochs, eps_clip, action_std, ppo_loss_coef, critic_loss_coef, entropy_coef):
-        self.actor_critic = actor_critic
-        self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
-        self.gamma = gamma
-        self.K_epochs = K_epochs
-        self.eps_clip = eps_clip
-        self.action_std = action_std
-        self.ppo_loss_coef = ppo_loss_coef
-        self.critic_loss_coef = critic_loss_coef
-        self.entropy_coef = entropy_coef
-        self.mse_loss = nn.MSELoss()
-
-    def select_action(self, state, memory):
-        state = torch.FloatTensor(state).unsqueeze(0)
-        action_mean, _ = self.actor_critic(state)
-        action_var = torch.full((action_mean.size(-1),), self.action_std**2)
-        cov_mat = torch.diag(action_var).unsqueeze(0)
-        
-        dist = MultivariateNormal(action_mean, covariance_matrix=cov_mat)
-        action = dist.sample()
-        action_logprob = dist.log_prob(action)
-        
-        memory.states.append(state)
-        memory.actions.append(action)
-        memory.logprobs.append(action_logprob)
-        
-        return action.detach().cpu().numpy().flatten()
-
-    def update(self, memory):
-        rewards = []
-        discounted_reward = 0
-        for reward, is_terminal in zip(reversed(memory.rewards), reversed(memory.is_terminals)):
-            if is_terminal:
-                discounted_reward = 0
-            discounted_reward = reward + (self.gamma * discounted_reward)
-            rewards.insert(0, discounted_reward)
-
-        rewards = torch.tensor(rewards, dtype=torch.float32)
-        old_states = torch.cat(memory.states).detach()
-        old_actions = torch.cat(memory.actions).detach()
-        old_logprobs = torch.cat(memory.logprobs).detach()
-
-        for _ in range(self.K_epochs):
-            action_means, state_values = self.actor_critic(old_states)
-            action_var = torch.full((action_means.size(-1),), self.action_std**2)
-            cov_mat = torch.diag(action_var).unsqueeze(0)
-
-            dist = MultivariateNormal(action_means, covariance_matrix=cov_mat)
-            action_logprobs = dist.log_prob(old_actions)
-            dist_entropy = dist.entropy()
-            state_values = torch.squeeze(state_values)
-
-            advantages = rewards - state_values.detach()
-
-            ratios = torch.exp(action_logprobs - old_logprobs)
-            surr1 = ratios * advantages
-            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
-
-            loss = self.ppo_loss_coef * -torch.min(surr1, surr2) + self.critic_loss_coef * self.mse_loss(state_values, rewards) - self.entropy_coef * dist_entropy
-
-            self.optimizer.zero_grad()
-            loss.mean().backward()
-            self.optimizer.step()
 
 class Memory:
     def __init__(self):
@@ -131,31 +68,112 @@ class Memory:
         del self.rewards[:]
         del self.is_terminals[:]
 
-class GAE:
-    def __init__(self, gamma, lamda):
+class PPO:
+    def __init__(self, actor_critic, lr, gamma, lamda, K_epochs, eps_clip, action_std, ppo_loss_coef, critic_loss_coef, entropy_coef, batch_size):
+        self.actor_critic = actor_critic
+        self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
         self.gamma = gamma
         self.lamda = lamda
+        self.K_epochs = K_epochs
+        self.eps_clip = eps_clip
+        self.action_std = action_std
+        self.ppo_loss_coef = ppo_loss_coef
+        self.critic_loss_coef = critic_loss_coef
+        self.entropy_coef = entropy_coef
+        self.mse_loss = nn.MSELoss()
+        self.batch_size = batch_size
 
-    def compute_gae(self, rewards, values, next_values, dones):
+    def select_action(self, state, memory):
+        state = torch.FloatTensor(state).unsqueeze(0)
+        
+        with torch.no_grad():
+            action_mean, _ = self.actor_critic(state)
+            action_var = torch.full((action_mean.size(-1),), self.action_std**2)
+            cov_mat = torch.diag(action_var).unsqueeze(0)
+            
+            dist = MultivariateNormal(action_mean, covariance_matrix=cov_mat)
+            action = dist.sample()
+            action_logprob = dist.log_prob(action)
+            
+        memory.states.append(state)
+        memory.actions.append(action)
+        memory.logprobs.append(action_logprob)
+
+        return action.detach().cpu().numpy().flatten()
+
+    
+    def rtg(self, rewards, is_terms):
+        out = []
+        discounted_reward = 0
+        for reward, is_terminal in zip(reversed(rewards), reversed(is_terms)):
+            if is_terminal:
+                discounted_reward = 0
+            discounted_reward = reward + (self.gamma * discounted_reward)
+            out.insert(0, discounted_reward)
+        return out
+
+    def compute_advantages(self, rewards, state_values, is_terminals):
         advantages = []
         gae = 0
-        for i in reversed(range(len(rewards))):
-            delta = rewards[i] + self.gamma * next_values[i] * (1 - dones[i]) - values[i]
-            gae = delta + self.gamma * self.lamda * (1 - dones[i]) * gae
-            advantages.insert(0, gae)
-        return advantages
+        state_values = torch.cat((state_values, torch.tensor([0.0])))  # Add a zero to handle the last state value
 
-    def compute_returns(self, rewards, dones, values, next_values):
-        advantages = self.compute_gae(rewards, values, next_values, dones)
-        returns = [adv + val for adv, val in zip(advantages, values)]
-        return returns
-    
-def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, lr, gamma, K_epochs, eps_clip, action_std, gae_lambda, ppo_loss_coef, critic_loss_coef, entropy_coef):
+        for step in reversed(range(len(rewards))):
+            delta = rewards[step] + self.gamma * state_values[step + 1] * (1 - is_terminals[step]) - state_values[step]
+            gae = delta + self.gamma * self.lamda * (1 - is_terminals[step]) * gae
+            advantages.insert(0, gae)
+
+        advantages = torch.tensor(advantages, dtype=torch.float32)
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        returns = advantages + state_values[:-1]
+
+        return advantages, returns
+
+    def update(self, memory):
+        rewards = torch.tensor(memory.rewards, dtype=torch.float32)
+        is_terms = torch.tensor(memory.is_terminals, dtype=torch.float32)
+        returns = self.rtg(memory.rewards, memory.is_terminals)
+        returns = torch.tensor(returns, dtype=torch.float32)
+
+        old_states = torch.cat(memory.states).detach()
+        old_actions = torch.cat(memory.actions).detach()
+        old_logprobs = torch.cat(memory.logprobs).detach()
+
+        for _ in range(self.K_epochs):
+            action_means, state_values = self.actor_critic(old_states)
+            action_var = torch.full((action_means.size(-1),), self.action_std**2)
+            cov_mat = torch.diag(action_var).unsqueeze(0)
+
+            dist = MultivariateNormal(action_means, covariance_matrix=cov_mat)
+            action_logprobs = dist.log_prob(old_actions)
+            dist_entropy = dist.entropy()
+            state_values = torch.squeeze(state_values)
+
+            # advantages, returns = self.compute_advantages(rewards, state_values, is_terms)
+
+            advantages = returns - state_values.detach()
+
+            ratios = torch.exp(action_logprobs - old_logprobs)
+            surr1 = ratios * advantages
+            surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+
+            loss = self.ppo_loss_coef * -torch.min(surr1, surr2) + self.critic_loss_coef * self.mse_loss(state_values, returns) - self.entropy_coef * dist_entropy
+
+            self.optimizer.zero_grad()
+            loss.mean().backward()
+            self.optimizer.step()
+
+def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, lr, gamma, K_epochs, eps_clip, action_std, gae_lambda, ppo_loss_coef, critic_loss_coef, entropy_coef, batch_size):
     timestep = 0
     actor_critic = ActorCritic(state_dim, action_dim, hidden_dim)
-    ppo = PPO(actor_critic, lr, gamma, K_epochs, eps_clip, action_std, ppo_loss_coef, critic_loss_coef, entropy_coef)
-    gae = GAE(gamma, gae_lambda)
+    ppo = PPO(actor_critic, lr, gamma, gae_lambda, K_epochs, eps_clip, action_std, ppo_loss_coef, critic_loss_coef, entropy_coef, batch_size)
     memory = Memory()
+    
+    episode_returns = []
+    running_avg_returns = []
+    
+    plt.ion()
+    fig, ax = plt.subplots()
     
     for episode in range(1, max_episodes + 1):
         render_mode = 'human' if episode % 200 == 0 else None
@@ -173,11 +191,6 @@ def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, 
             memory.is_terminals.append(done or trunc)
 
             if timestep % update_timestep == 0:
-                _, next_value = actor_critic(torch.FloatTensor(next_state).unsqueeze(0))
-                values = [actor_critic(torch.FloatTensor(s).unsqueeze(0))[1].item() for s in memory.states]
-                next_values = values[1:] + [next_value.item()]
-                returns = gae.compute_returns(memory.rewards, memory.is_terminals, values, next_values)
-                memory.returns = torch.tensor(returns)
                 ppo.update(memory)
                 memory.clear_memory()
                 timestep = 0
@@ -186,8 +199,25 @@ def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, 
             if done or trunc:
                 break
 
+        episode_returns.append(total_reward)
+        running_avg = np.mean(episode_returns[-log_interval:]) if episode >= log_interval else np.mean(episode_returns)
+        running_avg_returns.append(running_avg)
+        
         if episode % log_interval == 0:
             print(f'ep {episode:6} return {total_reward:.2f}')
 
+            # Dynamic plotting
+            ax.clear()
+            ax.plot(episode_returns, label='Returns')
+            ax.plot(running_avg_returns, label='Running Average Returns')
+            ax.axhline(y=max(episode_returns), color='r', linestyle='--', label='Max Return')
+            ax.legend()
+            ax.set_xlabel('Episode')
+            ax.set_ylabel('Return')
+            plt.pause(0.01)
+    
+    plt.ioff()
+    plt.show()
+
 if __name__ == '__main__':
-    train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, lr, gamma, K_epochs, eps_clip, action_std, gae_lambda, ppo_loss_coef, critic_loss_coef, entropy_coef)
+    train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, lr, gamma, K_epochs, eps_clip, action_std, gae_lambda, ppo_loss_coef, critic_loss_coef, entropy_coef, batch_size)
