@@ -14,43 +14,47 @@ env_name = 'LunarLanderContinuous-v2'
 state_dim = 8
 action_dim = 2
 max_episodes = 5000
-max_timesteps = 3000
-update_timestep = 10000
+max_timesteps = 2000
+update_timestep = 4000
 log_interval = 20
 hidden_dim = 128
 lr = 3e-4
 gamma = 0.99
-K_epochs = 1
-eps_clip = 0.2
-action_std = 0.5
-gae_lambda = 0.95
+K_epochs = 3
+eps_clip = 0.25
+action_std = 1.0
+gae_lambda = 0.99
 ppo_loss_coef = 1.0
-critic_loss_coef = 0.5
-entropy_coef = 0.05
-batch_size = 32
+critic_loss_coef = 0.6
+entropy_coef = 0.01
+batch_size = 128
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim):
         super(ActorCritic, self).__init__()
         # Actor network
         self.actor_fc1 = nn.Linear(state_dim, hidden_dim)
-        self.actor_fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.actor_out = nn.Linear(hidden_dim, action_dim)
+        self.actor_fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.actor_fc3 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
+        self.actor_out = nn.Linear(hidden_dim // 4, action_dim)
         
         # Critic network
         self.critic_fc1 = nn.Linear(state_dim, hidden_dim)
-        self.critic_fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.critic_out = nn.Linear(hidden_dim, 1)
+        self.critic_fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.critic_fc3 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
+        self.critic_out = nn.Linear(hidden_dim // 4, 1)
 
     def forward(self, state):
         # Actor network forward pass
         x = F.relu(self.actor_fc1(state))
         x = F.relu(self.actor_fc2(x))
+        x = F.relu(self.actor_fc3(x))
         action_mean = torch.tanh(self.actor_out(x))  # Continuous action space
         
         # Critic network forward pass
         v = F.relu(self.critic_fc1(state))
         v = F.relu(self.critic_fc2(v))
+        v = F.relu(self.critic_fc3(v))
         value = self.critic_out(v)
         
         return action_mean, value
@@ -134,6 +138,9 @@ class PPO:
         with torch.no_grad():
             rewards = torch.tensor(memory.rewards, dtype=torch.float32)
             is_terms = torch.tensor(memory.is_terminals, dtype=torch.float32)
+
+            # returns = torch.tensor(self.rtg(rewards, is_terms), dtype=torch.float32)
+
             old_states = torch.cat(memory.states).detach()
             old_actions = torch.cat(memory.actions).detach()
             old_logprobs = torch.cat(memory.logprobs).detach()
@@ -143,9 +150,11 @@ class PPO:
         
         dataset = TensorDataset(old_states, old_actions, old_logprobs, advantages, returns)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        
         for _ in range(self.K_epochs):
             for batch in dataloader:
+
+                # if i > self.K_epochs: break
+                
                 batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns = batch
                 
                 # Forward pass
