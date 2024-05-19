@@ -14,47 +14,53 @@ env_name = 'LunarLanderContinuous-v2'
 state_dim = 8
 action_dim = 2
 max_episodes = 5000
-max_timesteps = 2000
+max_timesteps = 1000
 update_timestep = 4000
 log_interval = 20
 hidden_dim = 128
 lr = 3e-4
 gamma = 0.99
 K_epochs = 3
-eps_clip = 0.25
+eps_clip = 0.2
 action_std = 1.0
 gae_lambda = 0.99
 ppo_loss_coef = 1.0
-critic_loss_coef = 0.6
-entropy_coef = 0.01
-batch_size = 128
+critic_loss_coef = 0.5
+entropy_coef = 0.1
+batch_size = 32
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim):
+    def __init__(self, state_dim, action_dim, hidden_dim, dropout_rate=0.2):
         super(ActorCritic, self).__init__()
         # Actor network
         self.actor_fc1 = nn.Linear(state_dim, hidden_dim)
-        self.actor_fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.actor_fc3 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
-        self.actor_out = nn.Linear(hidden_dim // 4, action_dim)
+        self.actor_ln1 = nn.LayerNorm(hidden_dim)
+        self.actor_fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.actor_ln2 = nn.LayerNorm(hidden_dim)
+        self.actor_out = nn.Linear(hidden_dim, action_dim)
+        self.actor_dropout = nn.Dropout(dropout_rate)
         
         # Critic network
         self.critic_fc1 = nn.Linear(state_dim, hidden_dim)
-        self.critic_fc2 = nn.Linear(hidden_dim, hidden_dim // 2)
-        self.critic_fc3 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
-        self.critic_out = nn.Linear(hidden_dim // 4, 1)
+        self.critic_ln1 = nn.LayerNorm(hidden_dim)
+        self.critic_fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.critic_ln2 = nn.LayerNorm(hidden_dim)
+        self.critic_out = nn.Linear(hidden_dim, 1)
+        self.critic_dropout = nn.Dropout(dropout_rate)
 
     def forward(self, state):
         # Actor network forward pass
-        x = F.relu(self.actor_fc1(state))
-        x = F.relu(self.actor_fc2(x))
-        x = F.relu(self.actor_fc3(x))
+        x = F.relu(self.actor_ln1(self.actor_fc1(state)))
+        x = self.actor_dropout(x)
+        x = F.relu(self.actor_ln2(self.actor_fc2(x)))
+        x = self.actor_dropout(x)
         action_mean = torch.tanh(self.actor_out(x))  # Continuous action space
         
         # Critic network forward pass
-        v = F.relu(self.critic_fc1(state))
-        v = F.relu(self.critic_fc2(v))
-        v = F.relu(self.critic_fc3(v))
+        v = F.relu(self.critic_ln1(self.critic_fc1(state)))
+        v = self.critic_dropout(v)
+        v = F.relu(self.critic_ln2(self.critic_fc2(v)))
+        v = self.critic_dropout(v)
         value = self.critic_out(v)
         
         return action_mean, value
@@ -138,23 +144,20 @@ class PPO:
         with torch.no_grad():
             rewards = torch.tensor(memory.rewards, dtype=torch.float32)
             is_terms = torch.tensor(memory.is_terminals, dtype=torch.float32)
-
-            # returns = torch.tensor(self.rtg(rewards, is_terms), dtype=torch.float32)
-
+            
             old_states = torch.cat(memory.states).detach()
             old_actions = torch.cat(memory.actions).detach()
             old_logprobs = torch.cat(memory.logprobs).detach()
             _, state_values = self.actor_critic(old_states)
             state_values = torch.squeeze(state_values)
+
+            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
             advantages, returns = self.compute_advantages(rewards, state_values, is_terms)
         
         dataset = TensorDataset(old_states, old_actions, old_logprobs, advantages, returns)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         for _ in range(self.K_epochs):
             for batch in dataloader:
-
-                # if i > self.K_epochs: break
-                
                 batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns = batch
                 
                 # Forward pass
@@ -180,9 +183,10 @@ class PPO:
                 # Total loss
                 loss = self.ppo_loss_coef * actor_loss + self.critic_loss_coef * critic_loss - self.entropy_coef * entropy_loss
 
-                # Backward pass and optimizer step
+                # Backward pass and optimizer step with gradient clipping
                 self.optimizer.zero_grad()
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=0.5)
                 self.optimizer.step()
 
 def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, lr, gamma, K_epochs, eps_clip, action_std, gae_lambda, ppo_loss_coef, critic_loss_coef, entropy_coef, batch_size):
