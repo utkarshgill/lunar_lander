@@ -1,5 +1,4 @@
-What is this?
+<100K steps PPO + GAE agent lands on the moon. One small step for man one giant leap for humanity.
 
-we are trying to solve a Reinforcement learning problem: LunarLander_v2
+TODO: parallel vector env
 
-1. Vanilla policy gradient
