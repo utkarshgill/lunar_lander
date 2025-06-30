@@ -8,7 +8,7 @@ import os
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import trange
 
-env_name = 'LunarLanderContinuous-v2'
+env_name = 'LunarLanderContinuous-v3'
 state_dim = 8
 action_dim = 2
 num_envs = int(os.getenv('NUM_ENVS', 8))
