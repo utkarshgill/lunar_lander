@@ -290,7 +290,7 @@ def render_policy(env_name, actor_critic, max_timesteps):
 
 Training stops when evaluation consistently hits the target score (200 is fine, but arguably stricter 240 gives you a better policy).
 
-<img src="/assets/lander_graph.png" alt="Lunar Lander training graph"/>
+<img src="https://github.com/user-attachments/assets/e9b3c0d0-7e82-4148-991b-b0a4387664a8" alt="Lunar Lander training graph"/>
 
 ---
 
