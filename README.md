@@ -165,7 +165,9 @@ But the advantage estimate $$\hat{A}_t$$ matters just as much as the clipping. T
 
 The solution was GAE. Instead of picking one way to estimate advantages, combine them all. You can estimate advantages using 1-step returns, 2-step returns, or full episode returns. GAE weights them exponentially:
 
-<pre> $$\hat{A}_t^{\text{GAE}(\gamma,\lambda)} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}^V$$ </pre>
+$$
+\hat{A}_t^{\text{GAE}(\gamma,\lambda)} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}^V
+$$
 
 Where $$\delta_t^V = r_t + \gamma V(s_{t+1}) - V(s_t)$$ is the temporal difference error.
 
