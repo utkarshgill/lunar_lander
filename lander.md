@@ -256,7 +256,7 @@ Training stops when evaluation consistently hits the target score (200 is fine, 
 
 ---
 
-The solution wasn’t a new paper or a fancy architecture. The solution is `beautiful_lander.py`, and it’s a basic PPO implementation with every screw tightened.
+The solution wasn’t fancy. The solution is `beautiful_lander.py`, and it’s a basic PPO implementation with every screw tightened.
 
 1. Curse of sparsity: One environment is too slow. You need an multiple landers learning in parallel. gym.vector.SyncVectorEnv was the first real step forward. More data, more diversity, less time.
 
