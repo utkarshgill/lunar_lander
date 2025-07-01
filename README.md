@@ -100,7 +100,9 @@ There are a bunch of RL algorithms to choose from. [OpenAI's Spinning Up](https:
 
 The PPO loss is defined like this:
 
-$$L^{CLIP}(\theta) = \mathbb{E}_t \left[ \min \left( r_t(\theta) \hat{A}_t, \text{clip}(r_t(\theta), 1-\varepsilon, 1+\varepsilon) \hat{A}_t \right) \right]$$
+$$
+\hat{A}_t^{\text{GAE}(\gamma,\lambda)} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}^V
+$$
 
 Where $r_t(\theta)$ is the probability ratio:
 
