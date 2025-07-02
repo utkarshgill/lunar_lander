@@ -127,6 +127,26 @@ class PPO:
         advantages = returns - state_values_pad[:-1]
         return advantages.reshape(-1), returns.reshape(-1)
     
+    def compute_losses(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
+        action_means, state_values = self.actor_critic(batch_states)
+        
+        std_tensor = torch.ones_like(action_means) * self.action_std
+        dist = torch.distributions.Normal(action_means, std_tensor)
+        
+        action_logprobs = dist.log_prob(batch_actions).sum(-1)
+        state_values = torch.squeeze(state_values)
+        
+        # PPO actor loss with clipping
+        ratios = torch.exp(action_logprobs - batch_logprobs.detach())
+        surr1 = ratios * batch_advantages
+        surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
+        actor_loss = -torch.min(surr1, surr2).mean()
+        
+        # Critic loss
+        critic_loss = F.mse_loss(state_values, batch_returns)
+        
+        return actor_loss, critic_loss
+    
     def update(self, memory):
         with torch.no_grad():
             # Use raw rewards - normalization adds noise
@@ -156,21 +176,9 @@ class PPO:
             for batch in dataloader:
                 batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns = batch
                 
-                action_means, state_values = self.actor_critic(batch_states)
-                
-                std_tensor = torch.ones_like(action_means) * self.action_std
-                dist = torch.distributions.Normal(action_means, std_tensor)
-                
-                action_logprobs = dist.log_prob(batch_actions).sum(-1)
-                state_values = torch.squeeze(state_values)
-                
-                # PPO losses
-                ratios = torch.exp(action_logprobs - batch_logprobs.detach())
-                surr1 = ratios * batch_advantages
-                surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
-                actor_loss = -torch.min(surr1, surr2).mean()
-                
-                critic_loss = F.mse_loss(state_values, batch_returns)
+                actor_loss, critic_loss = self.compute_losses(
+                    batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns
+                )
                 
                 # Update actor
                 self.actor_optimizer.zero_grad()
