@@ -15,53 +15,51 @@ num_envs = int(os.getenv('NUM_ENVS', 8))
 
 max_episodes = 500
 max_timesteps = 1000
-
-update_timestep = 4096          # more data per update
+update_timestep = 8000          # more data per update
 log_interval = 10               
-batch_size = 512               
-K_epochs = 6                   # squeeze more learning from each rollout                   
-
-hidden_dim = 512
-
-lr_actor = 1e-4                # much slower - prevent policy collapse
-lr_critic = 5e-4               # moderate critic learning
-
-gamma = 0.998                  # longer horizon for landing task
-gae_lambda = 0.98              # less bias in advantage estimates
-eps_clip = 0.15                # moderate clipping
-
-action_std = 0.6               # aggressive exploration to find landing zone
-
-eval_interval = 40             
-solved_threshold = 240
+batch_size = 128               
+K_epochs = 10                   # squeeze more learning from each rollout                   
+hidden_dim = 256
+num_hidden_layers = 2
+lr_actor = 1e-4               
+lr_critic = 5e-4              
+gamma = 0.99                  
+gae_lambda = 0.95
+eps_clip = 0.2
+action_std = 1.0              
+eval_interval = 20             
+solved_threshold = 250
 
 PLOT = bool(int(os.getenv('PLOT', '0')))
 RENDER = bool(int(os.getenv('RENDER', '0')))
 
 if PLOT: import matplotlib.pyplot as plt
 
-# ============================================================================
-
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim):
+    def __init__(self, state_dim, action_dim, hidden_dim, num_hidden_layers):
         super(ActorCritic, self).__init__()
+        self.actor_layers = nn.ModuleList()
+        self.critic_layers = nn.ModuleList()
+
+        if num_hidden_layers < 1: raise ValueError("num_hidden_layers must be at least 1")
+
         # Actor network
-        self.actor_fc1 = nn.Linear(state_dim, hidden_dim)
-        self.actor_fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.actor_layers.append(nn.Linear(state_dim, hidden_dim))
+        for _ in range(num_hidden_layers - 1): self.actor_layers.append(nn.Linear(hidden_dim, hidden_dim))
         self.actor_out = nn.Linear(hidden_dim, action_dim)
-        
+
         # Critic network
-        self.critic_fc1 = nn.Linear(state_dim, hidden_dim)
-        self.critic_fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.critic_layers.append(nn.Linear(state_dim, hidden_dim))
+        for _ in range(num_hidden_layers - 1): self.critic_layers.append(nn.Linear(hidden_dim, hidden_dim))
         self.critic_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, state):
-        x = F.relu(self.actor_fc1(state))
-        x = F.relu(self.actor_fc2(x))
+        x = state
+        for layer in self.actor_layers: x = F.relu(layer(x))
         action_mean = torch.tanh(self.actor_out(x))
         
-        v = F.relu(self.critic_fc1(state))
-        v = F.relu(self.critic_fc2(v))
+        v = state
+        for layer in self.critic_layers: v = F.relu(layer(v))
         value = self.critic_out(v)
         
         return action_mean, value
@@ -198,9 +196,9 @@ class PPO:
                 )
                 self.critic_optimizer.step()
 
-def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std, gae_lambda, batch_size, num_envs=1):
+def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, num_hidden_layers, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std, gae_lambda, batch_size, num_envs=1):
     timestep = 0
-    actor_critic = ActorCritic(state_dim, action_dim, hidden_dim)
+    actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, num_hidden_layers)
     ppo = PPO(actor_critic, lr_actor, lr_critic, gamma, gae_lambda, K_epochs, eps_clip, action_std, batch_size)
     memory = Memory()
     
@@ -322,4 +320,4 @@ def render_policy(env_name, actor_critic, max_timesteps):
     return total
 
 if __name__ == '__main__':
-    train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std, gae_lambda, batch_size, num_envs=num_envs)
+    train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, num_hidden_layers, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std, gae_lambda, batch_size, num_envs=num_envs)
