@@ -12,8 +12,8 @@ pygame needs the SDL2 headers to build when using the `gymnasium[box2d]` extra. 
   ```bash
   sudo apt-get install libsdl2-dev libsdl2-image-dev libsdl2-mixer-dev libsdl2-ttf-dev
   ```
+## make env, install deps and run
 
-install deps and run beautiful_lander.py
 ```python
 python -m venv .venv
 source .venv/bin/activate
