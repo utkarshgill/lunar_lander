@@ -110,7 +110,7 @@ class PPO:
 
         return action.detach().cpu().numpy()
 
-    def compute_advantages(self, rewards, state_values, is_terminals):
+    def compute_advantages(self, rewards, state_values, is_terminals, normalize=True):
         T, N = rewards.shape
         device = rewards.device
         returns = torch.zeros_like(rewards)
@@ -123,6 +123,9 @@ class PPO:
             returns[t] = gae + state_values_pad[t]
 
         advantages = returns - state_values_pad[:-1]
+        if normalize:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
         return advantages.reshape(-1), returns.reshape(-1)
     
     def compute_losses(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
