@@ -11,7 +11,7 @@ from tqdm import trange
 env_name = 'LunarLanderContinuous-v3'
 state_dim = 8
 action_dim = 2
-num_envs = int(os.getenv('NUM_ENVS', 8))
+num_envs = int(os.getenv('NUM_ENVS', 10))
 
 max_episodes = 1000
 max_timesteps = 1000
