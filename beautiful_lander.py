@@ -13,9 +13,9 @@ state_dim = 8
 action_dim = 2
 num_envs = int(os.getenv('NUM_ENVS', 8))
 
-max_episodes = 500
+max_episodes = 1000
 max_timesteps = 1000
-update_timestep = 8000          # more data per update
+update_timestep = 10_000          # more data per update
 log_interval = 10               
 batch_size = 128               
 K_epochs = 10                   # squeeze more learning from each rollout                   
@@ -26,12 +26,22 @@ lr_critic = 5e-4
 gamma = 0.99                  
 gae_lambda = 0.95
 eps_clip = 0.2
-action_std = 1.0              
-eval_interval = 20             
+eval_interval = 100             
 solved_threshold = 250
 
 PLOT = bool(int(os.getenv('PLOT', '0')))
 RENDER = bool(int(os.getenv('RENDER', '0')))
+METAL = bool(int(os.getenv('METAL', '0')))
+
+if METAL and torch.backends.mps.is_available():
+    device = torch.device('mps')
+    print("Using MPS (Metal) device")
+elif torch.cuda.is_available():
+    device = torch.device('cuda')
+    print("Using CUDA device")
+else:
+    device = torch.device('cpu')
+    print("Using CPU device")
 
 if PLOT: import matplotlib.pyplot as plt
 
@@ -47,6 +57,7 @@ class ActorCritic(nn.Module):
         self.actor_layers.append(nn.Linear(state_dim, hidden_dim))
         for _ in range(num_hidden_layers - 1): self.actor_layers.append(nn.Linear(hidden_dim, hidden_dim))
         self.actor_out = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))  # learnable std
 
         # Critic network
         self.critic_layers.append(nn.Linear(state_dim, hidden_dim))
@@ -56,13 +67,14 @@ class ActorCritic(nn.Module):
     def forward(self, state):
         x = state
         for layer in self.actor_layers: x = F.relu(layer(x))
-        action_mean = torch.tanh(self.actor_out(x))
+        action_mean = self.actor_out(x)  # unbounded mean
+        action_std = self.log_std.exp()  # learnable std
         
         v = state
         for layer in self.critic_layers: v = F.relu(layer(v))
         value = self.critic_out(v)
         
-        return action_mean, value
+        return action_mean, action_std, value
 
 class Memory:
     def __init__(self):
@@ -80,10 +92,10 @@ class Memory:
         del self.is_terminals[:]
 
 class PPO:
-    def __init__(self, actor_critic, lr_actor, lr_critic, gamma, lamda, K_epochs, eps_clip, action_std, batch_size):
+    def __init__(self, actor_critic, lr_actor, lr_critic, gamma, lamda, K_epochs, eps_clip, batch_size):
         self.actor_critic = actor_critic
         # Use separate optimizers for actor and critic to decouple updates
-        actor_params = [p for n, p in actor_critic.named_parameters() if 'actor_' in n]
+        actor_params = [p for n, p in actor_critic.named_parameters() if 'actor_' in n or n == 'log_std']
         critic_params = [p for n, p in actor_critic.named_parameters() if 'critic_' in n]
         self.actor_optimizer = optim.Adam(actor_params, lr=lr_actor)
         self.critic_optimizer = optim.Adam(critic_params, lr=lr_critic)
@@ -91,21 +103,23 @@ class PPO:
         self.lamda = lamda
         self.K_epochs = K_epochs
         self.eps_clip = eps_clip
-        self.action_std = action_std
         self.batch_size = batch_size
 
     def select_action(self, state, memory):
-        state_tensor = torch.as_tensor(state, dtype=torch.float32)
+        state_tensor = torch.as_tensor(state, dtype=torch.float32).to(device)
 
         with torch.no_grad():
-            action_mean, _ = self.actor_critic(state_tensor)
-            std_tensor = torch.ones_like(action_mean) * self.action_std
-            dist = torch.distributions.Normal(action_mean, std_tensor)
-            action = dist.sample()
-            action_logprob = dist.log_prob(action).sum(-1)
+            action_mean, action_std, _ = self.actor_critic(state_tensor)
+            dist = torch.distributions.Normal(action_mean, action_std)
+            raw_action = dist.sample()  # unbounded sample
+            action = torch.tanh(raw_action)  # squash to [-1, 1]
+            
+            # change of variables correction
+            logp_gaussian = dist.log_prob(raw_action).sum(-1)
+            action_logprob = logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
 
         memory.states.append(state_tensor)
-        memory.actions.append(action)
+        memory.actions.append(raw_action)  # store raw action for gradient computation
         memory.logprobs.append(action_logprob)
 
         return action.detach().cpu().numpy()
@@ -129,12 +143,15 @@ class PPO:
         return advantages.reshape(-1), returns.reshape(-1)
     
     def compute_losses(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
-        action_means, state_values = self.actor_critic(batch_states)
+        action_means, action_stds, state_values = self.actor_critic(batch_states)
         
-        std_tensor = torch.ones_like(action_means) * self.action_std
-        dist = torch.distributions.Normal(action_means, std_tensor)
+        dist = torch.distributions.Normal(action_means, action_stds)
         
-        action_logprobs = dist.log_prob(batch_actions).sum(-1)
+        # batch_actions are raw (unbounded) actions
+        env_actions = torch.tanh(batch_actions)
+        logp_gaussian = dist.log_prob(batch_actions).sum(-1)
+        action_logprobs = logp_gaussian - torch.log(1 - env_actions**2 + 1e-6).sum(-1)
+        
         state_values = torch.squeeze(state_values)
         
         # PPO actor loss with clipping
@@ -151,14 +168,14 @@ class PPO:
     def update(self, memory):
         with torch.no_grad():
             # Use raw rewards - normalization adds noise
-            rewards = torch.as_tensor(np.stack(memory.rewards), dtype=torch.float32)
-            is_terms = torch.as_tensor(np.stack(memory.is_terminals), dtype=torch.float32)
+            rewards = torch.as_tensor(np.stack(memory.rewards), dtype=torch.float32).to(device)
+            is_terms = torch.as_tensor(np.stack(memory.is_terminals), dtype=torch.float32).to(device)
 
             old_states = torch.cat(memory.states)
             old_actions = torch.cat(memory.actions)
             old_logprobs = torch.cat(memory.logprobs)
 
-            _, old_state_values = self.actor_critic(old_states)
+            _, _, old_state_values = self.actor_critic(old_states)
             old_state_values = old_state_values.squeeze(-1)
 
             if rewards.dim() > 1:
@@ -185,7 +202,7 @@ class PPO:
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward(retain_graph=True)
                 torch.nn.utils.clip_grad_norm_(
-                    [p for n, p in self.actor_critic.named_parameters() if 'actor_' in n],
+                    [p for n, p in self.actor_critic.named_parameters() if 'actor_' in n or n == 'log_std'],
                     max_norm=0.5
                 )
                 self.actor_optimizer.step()
@@ -199,110 +216,164 @@ class PPO:
                 )
                 self.critic_optimizer.step()
 
-def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, num_hidden_layers, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std, gae_lambda, batch_size, num_envs=1):
+def train_one_epoch(env, ppo, memory, states, update_timestep, num_envs):
+    """
+    Run one epoch of PPO:
+    1. Collect experience until update_timestep steps
+    2. Update policy and value function
+    
+    Returns episode returns and current state for continuing rollout.
+    """
     timestep = 0
-    actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, num_hidden_layers)
-    ppo = PPO(actor_critic, lr_actor, lr_critic, gamma, gae_lambda, K_epochs, eps_clip, action_std, batch_size)
-    memory = Memory()
-    
     episode_returns = []
-    last_eval = float('-inf')
-    
-    if PLOT:
-        plt.ion()
-        fig, ax = plt.subplots()
-    
-    env = gym.vector.SyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
-    states, _ = env.reset()
-
-    pbar = trange(max_episodes, unit='ep')
     per_env_returns = np.zeros(num_envs)
-    completed_episodes = 0
-
-    while completed_episodes < max_episodes:
+    
+    while timestep < update_timestep:
         timestep += num_envs
-
+        
         actions = ppo.select_action(states, memory)
         next_states, rewards, terminated, truncated, _ = env.step(actions)
-
+        
         memory.rewards.append(rewards)
         memory.is_terminals.append(np.logical_or(terminated, truncated).astype(float))
-
+        
         per_env_returns += rewards
-
+        
         done_mask = np.logical_or(terminated, truncated)
         if np.any(done_mask):
             for idx in np.where(done_mask)[0]:
                 episode_returns.append(per_env_returns[idx])
-                pbar.update(1)
-                completed_episodes += 1
                 per_env_returns[idx] = 0.0
-
-                if completed_episodes % log_interval == 0:
-                    pbar.set_description(f"ep {completed_episodes} ret {episode_returns[-1]:.2f} eval {last_eval:.1f}")
-
-                    if PLOT and completed_episodes % (log_interval * 2) == 0:
-                        ax.clear()
-                        # Raw returns (faded)
-                        ax.plot(episode_returns, alpha=0.3)
-                        # Overlay 10-episode moving average for stability
-                        if len(episode_returns) >= 10:
-                            ma = np.convolve(episode_returns, np.ones(10)/10, mode='valid')
-                            ax.plot(range(9, len(episode_returns)), ma, label='10-ep MA')
-                        else:
-                            ax.plot(episode_returns, label='Returns')
-                        ax.legend(); ax.set_xlabel('Episode'); ax.set_ylabel('Return'); plt.pause(0.01)
-
-                if completed_episodes > 0 and completed_episodes % eval_interval == 0:
-                    eval_ret = evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=num_envs)
-                    last_eval = eval_ret
-                    pbar.set_description(f"ep {completed_episodes} ret {episode_returns[-1]:.2f} eval {last_eval:.1f}")
-
-                    if eval_ret >= solved_threshold:
-                        pbar.write(f"SOLVED with eval score: {eval_ret:.2f}")
-                        render_policy(env_name, actor_critic, max_timesteps)
-                        pbar.close()
-                        return
-
+            
             if hasattr(env, 'reset_done'):
                 states_reset, _ = env.reset_done()
                 next_states[done_mask] = states_reset
             else:
                 next_states, _ = env.reset()
                 per_env_returns[:] = 0.0
-
-        if timestep % update_timestep == 0:
-            ppo.update(memory)
-            memory.clear_memory()
-            timestep = 0
-
+        
         states = next_states
+    
+    # update policy
+    ppo.update(memory)
+    memory.clear_memory()
+    
+    return episode_returns, states
 
+def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, num_hidden_layers, lr_actor, lr_critic, gamma, K_epochs, eps_clip, gae_lambda, batch_size, num_envs=1):
+    actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, num_hidden_layers).to(device)
+    ppo = PPO(actor_critic, lr_actor, lr_critic, gamma, gae_lambda, K_epochs, eps_clip, batch_size)
+    memory = Memory()
+    
+    all_episode_returns = []
+    last_eval = float('-inf')
+    recent_train_avg = float('-inf')
+    
+    if PLOT:
+        plt.ion()
+        fig, ax = plt.subplots()
+    
+    env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
+    states, _ = env.reset()
+    
+    pbar = trange(max_episodes, unit='ep')
+    pbar.write("  ep |     ret | train_avg |    eval")
+    pbar.write("-" * 42)
+    completed_episodes = 0
+    
+    while completed_episodes < max_episodes:
+        # run one epoch: collect experience and update policy
+        epoch_returns, states = train_one_epoch(env, ppo, memory, states, update_timestep, num_envs)
+        all_episode_returns.extend(epoch_returns)
+        
+        for _ in epoch_returns:
+            pbar.update(1)
+            completed_episodes += 1
+            
+            if completed_episodes > 0 and completed_episodes % eval_interval == 0:
+                eval_ret = evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=num_envs)
+                last_eval = eval_ret
+                
+                # Compute rolling average of last 100 training episodes
+                recent_train_avg = np.mean(all_episode_returns[-100:]) if len(all_episode_returns) >= 100 else np.mean(all_episode_returns)
+                
+                # Log learned std for diagnostics
+                current_std = actor_critic.log_std.exp().detach().cpu().numpy()
+                std_info = f"std=[{current_std[0]:.3f}, {current_std[1]:.3f}]"
+                
+                desc = f"ep {completed_episodes:4d} | ret {all_episode_returns[-1]:7.2f} | train_avg {recent_train_avg:7.2f} | eval {last_eval:7.2f} | {std_info}"
+                pbar.set_description(desc)
+                pbar.write(f"ep {completed_episodes:4d} | ret {all_episode_returns[-1]:7.2f} | train_avg {recent_train_avg:7.2f} | eval {last_eval:7.2f} | {std_info}")
+                
+                # Render one episode after each eval (if RENDER=1)
+                if RENDER:
+                    render_policy(env_name, actor_critic, max_timesteps)
+                
+                # Check if SOLVED based on training average (more honest!)
+                if recent_train_avg >= solved_threshold:
+                    pbar.write(f"SOLVED with training avg: {recent_train_avg:.2f} (eval: {eval_ret:.2f})")
+                    pbar.close()
+                    env.close()
+                    if PLOT:
+                        plt.ioff()
+                        plt.show()
+                    return
+            
+            elif completed_episodes % log_interval == 0:
+                # Compute rolling average for logging
+                recent_train_avg = np.mean(all_episode_returns[-100:]) if len(all_episode_returns) >= 100 else np.mean(all_episode_returns)
+                
+                desc = f"ep {completed_episodes:4d} | ret {all_episode_returns[-1]:7.2f} | train_avg {recent_train_avg:7.2f} | eval {last_eval:7.2f}"
+                pbar.set_description(desc)
+                pbar.write(f"ep {completed_episodes:4d} | ret {all_episode_returns[-1]:7.2f} | train_avg {recent_train_avg:7.2f}")
+            
+            if PLOT and completed_episodes % (log_interval * 2) == 0:
+                ax.clear()
+                ax.plot(all_episode_returns, alpha=0.3)
+                if len(all_episode_returns) >= 10:
+                    ma = np.convolve(all_episode_returns, np.ones(10)/10, mode='valid')
+                    ax.plot(range(9, len(all_episode_returns)), ma, label='10-ep MA')
+                else:
+                    ax.plot(all_episode_returns, label='Returns')
+                ax.legend(); ax.set_xlabel('Episode'); ax.set_ylabel('Return'); plt.pause(0.01)
+    
+    env.close()
     if PLOT:
         plt.ioff()
         plt.show()
-
+    
     pbar.close()
 
 def evaluate_policy(env_name, actor_critic, max_timesteps, num_envs: int = 16):
-    env = gym.vector.SyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
+    env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
     states, _ = env.reset()
-    total_rewards = np.zeros(num_envs, dtype=np.float32)
+    episode_rewards = np.zeros(num_envs, dtype=np.float32)
+    finished_rewards = []
+    finished_mask = np.zeros(num_envs, dtype=bool)
     actor_critic.eval()
 
     with torch.no_grad():
         for _ in range(max_timesteps):
-            state_tensor = torch.as_tensor(states, dtype=torch.float32)
-            action_mean, _ = actor_critic(state_tensor)
-            actions_np = action_mean.cpu().numpy()
+            state_tensor = torch.as_tensor(states, dtype=torch.float32).to(device)
+            action_mean, _, _ = actor_critic(state_tensor)
+            actions_np = torch.tanh(action_mean).cpu().numpy()  # squash for environment
             states, rewards, terminated, truncated, _ = env.step(actions_np)
-            total_rewards += rewards
-            if np.all(np.logical_or(terminated, truncated)):
+            episode_rewards += rewards
+            
+            # Save reward when env finishes (first time only)
+            done_mask = np.logical_or(terminated, truncated)
+            for idx in np.where(done_mask)[0]:
+                if not finished_mask[idx]:
+                    finished_rewards.append(episode_rewards[idx])
+                    finished_mask[idx] = True
+            
+            # Stop when all envs finished at least once
+            if finished_mask.all():
                 break
 
     env.close()
     actor_critic.train()
-    return float(total_rewards.mean())
+    return float(np.mean(finished_rewards)) if finished_rewards else 0.0
 
 def render_policy(env_name, actor_critic, max_timesteps):
     env = gym.make(env_name, render_mode='human')
@@ -311,9 +382,9 @@ def render_policy(env_name, actor_critic, max_timesteps):
     actor_critic.eval()
     with torch.no_grad():
         for _ in range(max_timesteps):
-            s = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
-            action_mean, _ = actor_critic(s)
-            action = action_mean.squeeze(0).cpu().numpy()
+            s = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+            action_mean, _, _ = actor_critic(s)
+            action = torch.tanh(action_mean).squeeze(0).cpu().numpy()  # squash for environment
             state, reward, done, trunc, _ = env.step(action)
             total += reward
             if done or trunc:
@@ -323,4 +394,4 @@ def render_policy(env_name, actor_critic, max_timesteps):
     return total
 
 if __name__ == '__main__':
-    train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, num_hidden_layers, lr_actor, lr_critic, gamma, K_epochs, eps_clip, action_std, gae_lambda, batch_size, num_envs=num_envs)
+    train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, num_hidden_layers, lr_actor, lr_critic, gamma, K_epochs, eps_clip, gae_lambda, batch_size, num_envs=num_envs)
