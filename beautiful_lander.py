@@ -13,10 +13,10 @@ state_dim = 8
 action_dim = 2
 num_envs = int(os.getenv('NUM_ENVS', 10))
 
-max_episodes = 1000
+max_epochs = 500
 max_timesteps = 1000
-update_timestep = 10_000          # more data per update
-log_interval = 10               
+steps_per_epoch = 10_000        # timesteps to collect per epoch before update
+log_interval = 1                # log every N epochs
 batch_size = 128               
 K_epochs = 10                   # squeeze more learning from each rollout                   
 hidden_dim = 256
@@ -26,55 +26,61 @@ lr_critic = 5e-4
 gamma = 0.99                  
 gae_lambda = 0.95
 eps_clip = 0.2
-eval_interval = 100             
+eval_interval = 10              # evaluate every N epochs
 solved_threshold = 250
 
 PLOT = bool(int(os.getenv('PLOT', '0')))
 RENDER = bool(int(os.getenv('RENDER', '0')))
 METAL = bool(int(os.getenv('METAL', '0')))
 
+# device selection
 if METAL and torch.backends.mps.is_available():
     device = torch.device('mps')
-    print("Using MPS (Metal) device")
 elif torch.cuda.is_available():
     device = torch.device('cuda')
-    print("Using CUDA device")
 else:
     device = torch.device('cpu')
-    print("Using CPU device")
+print(f"Using {device} device")
 
 if PLOT: import matplotlib.pyplot as plt
+
+def tanh_log_prob(raw_action, dist):
+    """Compute log probability with tanh squashing (change of variables)"""
+    action = torch.tanh(raw_action)
+    logp_gaussian = dist.log_prob(raw_action).sum(-1)
+    return logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim, num_hidden_layers):
         super(ActorCritic, self).__init__()
-        self.actor_layers = nn.ModuleList()
-        self.critic_layers = nn.ModuleList()
-
-        if num_hidden_layers < 1: raise ValueError("num_hidden_layers must be at least 1")
-
+        
         # Actor network
-        self.actor_layers.append(nn.Linear(state_dim, hidden_dim))
-        for _ in range(num_hidden_layers - 1): self.actor_layers.append(nn.Linear(hidden_dim, hidden_dim))
-        self.actor_out = nn.Linear(hidden_dim, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))  # learnable std
+        actor_layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
+        for _ in range(num_hidden_layers - 1):
+            actor_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        self.actor = nn.Sequential(*actor_layers)
+        self.actor_mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(action_dim))
 
         # Critic network
-        self.critic_layers.append(nn.Linear(state_dim, hidden_dim))
-        for _ in range(num_hidden_layers - 1): self.critic_layers.append(nn.Linear(hidden_dim, hidden_dim))
+        critic_layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
+        for _ in range(num_hidden_layers - 1):
+            critic_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        self.critic = nn.Sequential(*critic_layers)
         self.critic_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, state):
-        x = state
-        for layer in self.actor_layers: x = F.relu(layer(x))
-        action_mean = self.actor_out(x)  # unbounded mean
-        action_std = self.log_std.exp()  # learnable std
-        
-        v = state
-        for layer in self.critic_layers: v = F.relu(layer(v))
-        value = self.critic_out(v)
-        
+        action_mean = self.actor_mean(self.actor(state))
+        action_std = self.log_std.exp()
+        value = self.critic_out(self.critic(state))
         return action_mean, action_std, value
+    
+    @torch.no_grad()
+    def act_deterministic(self, state):
+        """Deterministic action selection (for evaluation)"""
+        state_tensor = torch.as_tensor(state, dtype=torch.float32).to(device)
+        mean, _, _ = self(state_tensor)
+        return torch.tanh(mean).cpu().numpy()
 
 class Memory:
     def __init__(self):
@@ -84,19 +90,21 @@ class Memory:
         self.rewards = []
         self.is_terminals = []
 
-    def clear_memory(self):
-        del self.states[:]
-        del self.actions[:]
-        del self.logprobs[:]
-        del self.rewards[:]
-        del self.is_terminals[:]
+    def clear(self):
+        self.states.clear()
+        self.actions.clear()
+        self.logprobs.clear()
+        self.rewards.clear()
+        self.is_terminals.clear()
 
 class PPO:
     def __init__(self, actor_critic, lr_actor, lr_critic, gamma, lamda, K_epochs, eps_clip, batch_size):
         self.actor_critic = actor_critic
-        # Use separate optimizers for actor and critic to decouple updates
-        actor_params = [p for n, p in actor_critic.named_parameters() if 'actor_' in n or n == 'log_std']
-        critic_params = [p for n, p in actor_critic.named_parameters() if 'critic_' in n]
+        self.memory = Memory()
+        
+        # Separate optimizers for actor and critic
+        actor_params = list(actor_critic.actor.parameters()) + list(actor_critic.actor_mean.parameters()) + [actor_critic.log_std]
+        critic_params = list(actor_critic.critic.parameters()) + list(actor_critic.critic_out.parameters())
         self.actor_optimizer = optim.Adam(actor_params, lr=lr_actor)
         self.critic_optimizer = optim.Adam(critic_params, lr=lr_critic)
         self.gamma = gamma
@@ -105,54 +113,43 @@ class PPO:
         self.eps_clip = eps_clip
         self.batch_size = batch_size
 
-    def select_action(self, state, memory):
+    @torch.no_grad()
+    def __call__(self, state):
+        """Sample action from policy and store in memory (for training)"""
         state_tensor = torch.as_tensor(state, dtype=torch.float32).to(device)
-
-        with torch.no_grad():
-            action_mean, action_std, _ = self.actor_critic(state_tensor)
-            dist = torch.distributions.Normal(action_mean, action_std)
-            raw_action = dist.sample()  # unbounded sample
-            action = torch.tanh(raw_action)  # squash to [-1, 1]
-            
-            # change of variables correction
-            logp_gaussian = dist.log_prob(raw_action).sum(-1)
-            action_logprob = logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
-
-        memory.states.append(state_tensor)
-        memory.actions.append(raw_action)  # store raw action for gradient computation
-        memory.logprobs.append(action_logprob)
-
-        return action.detach().cpu().numpy()
-
-    def compute_advantages(self, rewards, state_values, is_terminals, normalize=True):
-        T, N = rewards.shape
-        device = rewards.device
-        returns = torch.zeros_like(rewards)
+        action_mean, action_std, _ = self.actor_critic(state_tensor)
+        dist = torch.distributions.Normal(action_mean, action_std)
+        raw_action = dist.sample()
         
+        # store in memory
+        self.memory.states.append(state_tensor)
+        self.memory.actions.append(raw_action)
+        self.memory.logprobs.append(tanh_log_prob(raw_action, dist))
+        
+        return torch.tanh(raw_action).cpu().numpy()
+
+    def compute_advantages(self, rewards, state_values, is_terminals):
+        """Compute GAE advantages and returns"""
+        T, N = rewards.shape
+        returns = torch.zeros_like(rewards)
         state_values_pad = torch.cat([state_values, state_values[-1:]], dim=0)
-        gae = torch.zeros(N, device=device)
+        gae = torch.zeros(N, device=rewards.device)
+        
         for t in reversed(range(T)):
             delta = rewards[t] + self.gamma * state_values_pad[t + 1] * (1 - is_terminals[t]) - state_values_pad[t]
             gae = delta + self.gamma * self.lamda * (1 - is_terminals[t]) * gae
             returns[t] = gae + state_values_pad[t]
 
         advantages = returns - state_values_pad[:-1]
-        if normalize:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
         return advantages.reshape(-1), returns.reshape(-1)
     
     def compute_losses(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
         action_means, action_stds, state_values = self.actor_critic(batch_states)
-        
         dist = torch.distributions.Normal(action_means, action_stds)
-        
-        # batch_actions are raw (unbounded) actions
-        env_actions = torch.tanh(batch_actions)
-        logp_gaussian = dist.log_prob(batch_actions).sum(-1)
-        action_logprobs = logp_gaussian - torch.log(1 - env_actions**2 + 1e-6).sum(-1)
-        
-        state_values = torch.squeeze(state_values)
+        action_logprobs = tanh_log_prob(batch_actions, dist)
+        state_values = state_values.squeeze()
         
         # PPO actor loss with clipping
         ratios = torch.exp(action_logprobs - batch_logprobs.detach())
@@ -165,15 +162,20 @@ class PPO:
         
         return actor_loss, critic_loss
     
-    def update(self, memory):
+    def store_rollout(self, rewards, dones):
+        """Store rewards and dones from rollout"""
+        self.memory.rewards.extend(rewards)
+        self.memory.is_terminals.extend(dones)
+    
+    def update(self):
+        """Update policy from collected experience, then clear memory"""
         with torch.no_grad():
-            # Use raw rewards - normalization adds noise
-            rewards = torch.as_tensor(np.stack(memory.rewards), dtype=torch.float32).to(device)
-            is_terms = torch.as_tensor(np.stack(memory.is_terminals), dtype=torch.float32).to(device)
+            rewards = torch.as_tensor(np.stack(self.memory.rewards), dtype=torch.float32).to(device)
+            is_terms = torch.as_tensor(np.stack(self.memory.is_terminals), dtype=torch.float32).to(device)
 
-            old_states = torch.cat(memory.states)
-            old_actions = torch.cat(memory.actions)
-            old_logprobs = torch.cat(memory.logprobs)
+            old_states = torch.cat(self.memory.states)
+            old_actions = torch.cat(self.memory.actions)
+            old_logprobs = torch.cat(self.memory.logprobs)
 
             _, _, old_state_values = self.actor_critic(old_states)
             old_state_values = old_state_values.squeeze(-1)
@@ -201,197 +203,133 @@ class PPO:
                 # Update actor
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward(retain_graph=True)
-                torch.nn.utils.clip_grad_norm_(
-                    [p for n, p in self.actor_critic.named_parameters() if 'actor_' in n or n == 'log_std'],
-                    max_norm=0.5
-                )
+                torch.nn.utils.clip_grad_norm_(self.actor_optimizer.param_groups[0]['params'], max_norm=0.5)
                 self.actor_optimizer.step()
 
                 # Update critic  
                 self.critic_optimizer.zero_grad()
                 critic_loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    [p for n, p in self.actor_critic.named_parameters() if 'critic_' in n],
-                    max_norm=1.0
-                )
+                torch.nn.utils.clip_grad_norm_(self.critic_optimizer.param_groups[0]['params'], max_norm=1.0)
                 self.critic_optimizer.step()
+        
+        # clear memory after update
+        self.memory.clear()
 
-def train_one_epoch(env, ppo, memory, states, update_timestep, num_envs):
-    """
-    Run one epoch of PPO:
-    1. Collect experience until update_timestep steps
-    2. Update policy and value function
-    
-    Returns episode returns and current state for continuing rollout.
-    """
+def rollout(env, policy, num_steps, num_envs):
+    """Collect trajectories from vectorized envs (like tiny_reinforce but vectorized)"""
+    states, _ = env.reset()
+    traj_rewards, traj_dones = [], []
+    ep_returns = []
+    ep_rets = np.zeros(num_envs)
     timestep = 0
-    episode_returns = []
-    per_env_returns = np.zeros(num_envs)
     
-    while timestep < update_timestep:
+    while timestep < num_steps:
         timestep += num_envs
-        
-        actions = ppo.select_action(states, memory)
+        actions = policy(states)
         next_states, rewards, terminated, truncated, _ = env.step(actions)
+        dones = np.logical_or(terminated, truncated)
         
-        memory.rewards.append(rewards)
-        memory.is_terminals.append(np.logical_or(terminated, truncated).astype(float))
+        traj_rewards.append(rewards)
+        traj_dones.append(dones)
+        ep_rets += rewards
         
-        per_env_returns += rewards
-        
-        done_mask = np.logical_or(terminated, truncated)
-        if np.any(done_mask):
-            for idx in np.where(done_mask)[0]:
-                episode_returns.append(per_env_returns[idx])
-                per_env_returns[idx] = 0.0
+        if np.any(dones):
+            for idx in np.where(dones)[0]:
+                ep_returns.append(ep_rets[idx])
+                ep_rets[idx] = 0.0
             
             if hasattr(env, 'reset_done'):
-                states_reset, _ = env.reset_done()
-                next_states[done_mask] = states_reset
+                next_states[dones] = env.reset_done()[0]
             else:
                 next_states, _ = env.reset()
-                per_env_returns[:] = 0.0
+                ep_rets[:] = 0.0
         
         states = next_states
     
-    # update policy
-    ppo.update(memory)
-    memory.clear_memory()
-    
-    return episode_returns, states
+    return (traj_rewards, traj_dones), ep_returns
 
-def train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, num_hidden_layers, lr_actor, lr_critic, gamma, K_epochs, eps_clip, gae_lambda, batch_size, num_envs=1):
+def train_one_epoch(env, ppo, steps_per_epoch, num_envs):
+    """Run one epoch: collect experience → update policy"""
+    (rewards, dones), ep_returns = rollout(env, ppo, steps_per_epoch, num_envs)
+    ppo.store_rollout(rewards, dones)
+    ppo.update()
+    return ep_returns
+
+def train():
+    # setup
     actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, num_hidden_layers).to(device)
     ppo = PPO(actor_critic, lr_actor, lr_critic, gamma, gae_lambda, K_epochs, eps_clip, batch_size)
-    memory = Memory()
+    env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
     
     all_episode_returns = []
     last_eval = float('-inf')
-    recent_train_avg = float('-inf')
     
     if PLOT:
         plt.ion()
         fig, ax = plt.subplots()
     
-    env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
-    states, _ = env.reset()
+    pbar = trange(max_epochs, desc="Training", unit='epoch')
+    pbar.write("epoch | n_ep | ep_ret_mean | ep_ret_std | train_100 |    eval |  std")
+    pbar.write("-" * 75)
     
-    pbar = trange(max_episodes, unit='ep')
-    pbar.write("  ep |     ret | train_avg |    eval")
-    pbar.write("-" * 42)
-    completed_episodes = 0
-    
-    while completed_episodes < max_episodes:
-        # run one epoch: collect experience and update policy
-        epoch_returns, states = train_one_epoch(env, ppo, memory, states, update_timestep, num_envs)
+    # main training loop
+    for epoch in range(max_epochs):
+        epoch_returns = train_one_epoch(env, ppo, steps_per_epoch, num_envs)
         all_episode_returns.extend(epoch_returns)
+        pbar.update(1)
         
-        for _ in epoch_returns:
-            pbar.update(1)
-            completed_episodes += 1
+        # logging
+        n_ep = len(epoch_returns)
+        ep_mean = np.mean(epoch_returns) if epoch_returns else 0.0
+        ep_std = np.std(epoch_returns) if epoch_returns else 0.0
+        train_100 = np.mean(all_episode_returns[-100:]) if all_episode_returns else 0.0
+        
+        if (epoch + 1) % eval_interval == 0:
+            eval_ret = evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=num_envs)
+            last_eval = eval_ret
+            std = actor_critic.log_std.exp().detach().cpu().numpy()
+            pbar.write(f"{epoch+1:5d} | {n_ep:4d} | {ep_mean:11.2f} | {ep_std:10.2f} | {train_100:9.2f} | {eval_ret:7.2f} | [{std[0]:.2f},{std[1]:.2f}]")
             
-            if completed_episodes > 0 and completed_episodes % eval_interval == 0:
-                eval_ret = evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=num_envs)
-                last_eval = eval_ret
-                
-                # Compute rolling average of last 100 training episodes
-                recent_train_avg = np.mean(all_episode_returns[-100:]) if len(all_episode_returns) >= 100 else np.mean(all_episode_returns)
-                
-                # Log learned std for diagnostics
-                current_std = actor_critic.log_std.exp().detach().cpu().numpy()
-                std_info = f"std=[{current_std[0]:.3f}, {current_std[1]:.3f}]"
-                
-                desc = f"ep {completed_episodes:4d} | ret {all_episode_returns[-1]:7.2f} | train_avg {recent_train_avg:7.2f} | eval {last_eval:7.2f} | {std_info}"
-                pbar.set_description(desc)
-                pbar.write(f"ep {completed_episodes:4d} | ret {all_episode_returns[-1]:7.2f} | train_avg {recent_train_avg:7.2f} | eval {last_eval:7.2f} | {std_info}")
-                
-                # Render one episode after each eval (if RENDER=1)
-                if RENDER:
-                    render_policy(env_name, actor_critic, max_timesteps)
-                
-                # Check if SOLVED based on training average (more honest!)
-                if recent_train_avg >= solved_threshold:
-                    pbar.write(f"SOLVED with training avg: {recent_train_avg:.2f} (eval: {eval_ret:.2f})")
-                    pbar.close()
-                    env.close()
-                    if PLOT:
-                        plt.ioff()
-                        plt.show()
-                    return
+            if RENDER:
+                evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=1, render=True)
             
-            elif completed_episodes % log_interval == 0:
-                # Compute rolling average for logging
-                recent_train_avg = np.mean(all_episode_returns[-100:]) if len(all_episode_returns) >= 100 else np.mean(all_episode_returns)
-                
-                desc = f"ep {completed_episodes:4d} | ret {all_episode_returns[-1]:7.2f} | train_avg {recent_train_avg:7.2f} | eval {last_eval:7.2f}"
-                pbar.set_description(desc)
-                pbar.write(f"ep {completed_episodes:4d} | ret {all_episode_returns[-1]:7.2f} | train_avg {recent_train_avg:7.2f}")
-            
-            if PLOT and completed_episodes % (log_interval * 2) == 0:
-                ax.clear()
-                ax.plot(all_episode_returns, alpha=0.3)
-                if len(all_episode_returns) >= 10:
-                    ma = np.convolve(all_episode_returns, np.ones(10)/10, mode='valid')
-                    ax.plot(range(9, len(all_episode_returns)), ma, label='10-ep MA')
-                else:
-                    ax.plot(all_episode_returns, label='Returns')
-                ax.legend(); ax.set_xlabel('Episode'); ax.set_ylabel('Return'); plt.pause(0.01)
+            if train_100 >= solved_threshold:
+                pbar.write(f"{'='*75}\nSOLVED at epoch {epoch+1}! train_100={train_100:.2f}, eval={eval_ret:.2f}\n{'='*75}")
+                break
+        
+        elif (epoch + 1) % log_interval == 0:
+            pbar.write(f"{epoch+1:5d} | {n_ep:4d} | {ep_mean:11.2f} | {ep_std:10.2f} | {train_100:9.2f} | {last_eval:7.2f}")
+        
+        if PLOT and (epoch + 1) % (log_interval * 2) == 0:
+            ax.clear()
+            ax.plot(all_episode_returns, alpha=0.3, label='Episode Returns')
+            if len(all_episode_returns) >= 100:
+                ma = np.convolve(all_episode_returns, np.ones(100)/100, mode='valid')
+                ax.plot(range(99, len(all_episode_returns)), ma, label='100-ep MA', linewidth=2)
+            ax.axhline(solved_threshold, color='red', linestyle='--', alpha=0.5, label=f'Solved ({solved_threshold})')
+            ax.legend(); ax.set_xlabel('Episode'); ax.set_ylabel('Return'); plt.pause(0.01)
     
     env.close()
+    pbar.close()
     if PLOT:
         plt.ioff()
         plt.show()
+
+def evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=16, render=False):
+    """Evaluate policy deterministically using rollout abstraction"""
+    render_mode = 'human' if render else None
+    env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name, render_mode=render_mode) for _ in range(num_envs)])
+    actor_critic.eval()
     
-    pbar.close()
-
-def evaluate_policy(env_name, actor_critic, max_timesteps, num_envs: int = 16):
-    env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
-    states, _ = env.reset()
-    episode_rewards = np.zeros(num_envs, dtype=np.float32)
-    finished_rewards = []
-    finished_mask = np.zeros(num_envs, dtype=bool)
-    actor_critic.eval()
-
-    with torch.no_grad():
-        for _ in range(max_timesteps):
-            state_tensor = torch.as_tensor(states, dtype=torch.float32).to(device)
-            action_mean, _, _ = actor_critic(state_tensor)
-            actions_np = torch.tanh(action_mean).cpu().numpy()  # squash for environment
-            states, rewards, terminated, truncated, _ = env.step(actions_np)
-            episode_rewards += rewards
-            
-            # Save reward when env finishes (first time only)
-            done_mask = np.logical_or(terminated, truncated)
-            for idx in np.where(done_mask)[0]:
-                if not finished_mask[idx]:
-                    finished_rewards.append(episode_rewards[idx])
-                    finished_mask[idx] = True
-            
-            # Stop when all envs finished at least once
-            if finished_mask.all():
-                break
-
+    _, ep_rets = rollout(env, actor_critic.act_deterministic, max_timesteps * num_envs, num_envs)
+    
     env.close()
     actor_critic.train()
-    return float(np.mean(finished_rewards)) if finished_rewards else 0.0
-
-def render_policy(env_name, actor_critic, max_timesteps):
-    env = gym.make(env_name, render_mode='human')
-    state, _ = env.reset()
-    total = 0.0
-    actor_critic.eval()
-    with torch.no_grad():
-        for _ in range(max_timesteps):
-            s = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
-            action_mean, _, _ = actor_critic(s)
-            action = torch.tanh(action_mean).squeeze(0).cpu().numpy()  # squash for environment
-            state, reward, done, trunc, _ = env.step(action)
-            total += reward
-            if done or trunc:
-                break
-    env.close()
-    actor_critic.train()
-    return total
+    
+    if not ep_rets:
+        return 0.0
+    # average first num_envs episodes (one per env)
+    return float(np.mean(ep_rets[:num_envs]))
 
 if __name__ == '__main__':
-    train(env_name, max_episodes, max_timesteps, update_timestep, log_interval, state_dim, action_dim, hidden_dim, num_hidden_layers, lr_actor, lr_critic, gamma, K_epochs, eps_clip, gae_lambda, batch_size, num_envs=num_envs)
+    train()
