@@ -9,43 +9,44 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import trange
 
 env_name = 'LunarLanderContinuous-v3'
-state_dim = 8
-action_dim = 2
+state_dim, action_dim = 8, 2
 num_envs = int(os.getenv('NUM_ENVS', 10))
 
-max_epochs = 500
-max_timesteps = 1000
-steps_per_epoch = 10_000        # timesteps to collect per epoch before update
-log_interval = 1                # log every N epochs
-batch_size = 128               
-K_epochs = 10                   # squeeze more learning from each rollout                   
-hidden_dim = 256
-num_hidden_layers = 2
-lr_actor = 1e-4               
-lr_critic = 5e-4              
-gamma = 0.99                  
-gae_lambda = 0.95
-eps_clip = 0.2
-eval_interval = 10              # evaluate every N epochs
+# https://gymnasium.farama.org/environments/box2d/lunar_lander/#:~:text=For%20the%20default%20values%20of%20VIEWPORT_W%2C%20VIEWPORT_H%2C%20SCALE%2C%20and%20FPS%2C%20the%20scale%20factors%20equal%3A%20%E2%80%98x%E2%80%99%3A%2010%2C%20%E2%80%98y%E2%80%99%3A%206.666%2C%20%E2%80%98vx%E2%80%99%3A%205%2C%20%E2%80%98vy%E2%80%99%3A%207.5%2C%20%E2%80%98angle%E2%80%99%3A%201%2C%20%E2%80%98angular%20velocity%E2%80%99%3A%202.5
+OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
+
+max_epochs, max_timesteps, steps_per_epoch = 200, 1000, 10_000
+log_interval, eval_interval = 10, 20
+batch_size, K_epochs = 128, 10
+hidden_dim, num_hidden_layers = 256, 2
+lr_actor, lr_critic = 1e-4, 5e-4
+gamma, gae_lambda, eps_clip = 0.99, 0.95, 0.2
 solved_threshold = 250
 
 PLOT = bool(int(os.getenv('PLOT', '0')))
 RENDER = bool(int(os.getenv('RENDER', '0')))
 METAL = bool(int(os.getenv('METAL', '0')))
 
-# device selection
-if METAL and torch.backends.mps.is_available():
-    device = torch.device('mps')
-elif torch.cuda.is_available():
-    device = torch.device('cuda')
-else:
-    device = torch.device('cpu')
+device = torch.device('mps' if METAL and torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using {device} device")
 
 if PLOT: import matplotlib.pyplot as plt
 
+def make_env(n, render=False):
+    render_mode = 'human' if render else None
+    return gym.vector.AsyncVectorEnv([lambda: gym.make(env_name, render_mode=render_mode) for _ in range(n)])
+
+def update_plot(ax, returns, threshold):
+    ax.clear()
+    ax.plot(returns, alpha=0.3, label='Episode Returns')
+    if len(returns) >= 100:
+        ma = np.convolve(returns, np.ones(100)/100, mode='valid')
+        ax.plot(range(99, len(returns)), ma, label='100-ep MA', linewidth=2)
+    ax.axhline(threshold, color='red', linestyle='--', alpha=0.5, label=f'Solved ({threshold})')
+    ax.legend(); ax.set_xlabel('Episode'); ax.set_ylabel('Return'); plt.pause(0.01)
+
 def tanh_log_prob(raw_action, dist):
-    """Compute log probability with tanh squashing (change of variables)"""
+    # Change of variables for tanh squashing
     action = torch.tanh(raw_action)
     logp_gaussian = dist.log_prob(raw_action).sum(-1)
     return logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
@@ -54,15 +55,15 @@ class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim, num_hidden_layers):
         super(ActorCritic, self).__init__()
         
-        # Actor network
+        # Actor
         actor_layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(num_hidden_layers - 1):
             actor_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
         self.actor = nn.Sequential(*actor_layers)
         self.actor_mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
-
-        # Critic network
+        
+        # Critic
         critic_layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(num_hidden_layers - 1):
             critic_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
@@ -77,34 +78,18 @@ class ActorCritic(nn.Module):
     
     @torch.no_grad()
     def act_deterministic(self, state):
-        """Deterministic action selection (for evaluation)"""
-        state_tensor = torch.as_tensor(state, dtype=torch.float32).to(device)
+        state_tensor = torch.as_tensor(state * OBS_SCALE, dtype=torch.float32).to(device)
         mean, _, _ = self(state_tensor)
         return torch.tanh(mean).cpu().numpy()
-
-class Memory:
-    def __init__(self):
-        self.states = []
-        self.actions = []
-        self.logprobs = []
-        self.rewards = []
-        self.is_terminals = []
-
-    def clear(self):
-        self.states.clear()
-        self.actions.clear()
-        self.logprobs.clear()
-        self.rewards.clear()
-        self.is_terminals.clear()
 
 class PPO:
     def __init__(self, actor_critic, lr_actor, lr_critic, gamma, lamda, K_epochs, eps_clip, batch_size):
         self.actor_critic = actor_critic
-        self.memory = Memory()
+        self.states, self.actions = [], []
         
         # Separate optimizers for actor and critic
-        actor_params = list(actor_critic.actor.parameters()) + list(actor_critic.actor_mean.parameters()) + [actor_critic.log_std]
-        critic_params = list(actor_critic.critic.parameters()) + list(actor_critic.critic_out.parameters())
+        actor_params = [*actor_critic.actor.parameters(), *actor_critic.actor_mean.parameters(), actor_critic.log_std]
+        critic_params = [*actor_critic.critic.parameters(), *actor_critic.critic_out.parameters()]
         self.actor_optimizer = optim.Adam(actor_params, lr=lr_actor)
         self.critic_optimizer = optim.Adam(critic_params, lr=lr_critic)
         self.gamma = gamma
@@ -115,32 +100,28 @@ class PPO:
 
     @torch.no_grad()
     def __call__(self, state):
-        """Sample action from policy and store in memory (for training)"""
-        state_tensor = torch.as_tensor(state, dtype=torch.float32).to(device)
+        state_tensor = torch.as_tensor(state * OBS_SCALE, dtype=torch.float32).to(device)
         action_mean, action_std, _ = self.actor_critic(state_tensor)
         dist = torch.distributions.Normal(action_mean, action_std)
         raw_action = dist.sample()
         
-        # store in memory
-        self.memory.states.append(state_tensor)
-        self.memory.actions.append(raw_action)
-        self.memory.logprobs.append(tanh_log_prob(raw_action, dist))
+        self.states.append(state_tensor)  # logprobs computed later in update()
+        self.actions.append(raw_action)
         
         return torch.tanh(raw_action).cpu().numpy()
 
     def compute_advantages(self, rewards, state_values, is_terminals):
-        """Compute GAE advantages and returns"""
         T, N = rewards.shape
-        returns = torch.zeros_like(rewards)
+        advantages = torch.zeros_like(rewards)
         state_values_pad = torch.cat([state_values, state_values[-1:]], dim=0)
         gae = torch.zeros(N, device=rewards.device)
         
         for t in reversed(range(T)):
             delta = rewards[t] + self.gamma * state_values_pad[t + 1] * (1 - is_terminals[t]) - state_values_pad[t]
             gae = delta + self.gamma * self.lamda * (1 - is_terminals[t]) * gae
-            returns[t] = gae + state_values_pad[t]
-
-        advantages = returns - state_values_pad[:-1]
+            advantages[t] = gae
+        
+        returns = advantages + state_values_pad[:-1]
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         return advantages.reshape(-1), returns.reshape(-1)
@@ -162,71 +143,56 @@ class PPO:
         
         return actor_loss, critic_loss
     
-    def store_rollout(self, rewards, dones):
-        """Store rewards and dones from rollout"""
-        self.memory.rewards.extend(rewards)
-        self.memory.is_terminals.extend(dones)
-    
-    def update(self):
-        """Update policy from collected experience, then clear memory"""
+    def update(self, rewards, dones):
         with torch.no_grad():
-            rewards = torch.as_tensor(np.stack(self.memory.rewards), dtype=torch.float32).to(device)
-            is_terms = torch.as_tensor(np.stack(self.memory.is_terminals), dtype=torch.float32).to(device)
+            rewards = torch.as_tensor(np.stack(rewards), dtype=torch.float32).to(device)
+            is_terms = torch.as_tensor(np.stack(dones), dtype=torch.float32).to(device)
 
-            old_states = torch.cat(self.memory.states)
-            old_actions = torch.cat(self.memory.actions)
-            old_logprobs = torch.cat(self.memory.logprobs)
+            old_states = torch.cat(self.states)
+            old_actions = torch.cat(self.actions)
 
-            _, _, old_state_values = self.actor_critic(old_states)
+            # Compute old log probs and values with policy BEFORE updates
+            action_means, action_stds, old_state_values = self.actor_critic(old_states)
+            dist = torch.distributions.Normal(action_means, action_stds)
+            old_logprobs = tanh_log_prob(old_actions, dist)
             old_state_values = old_state_values.squeeze(-1)
-
-            if rewards.dim() > 1:
-                N = rewards.size(1)
-                old_state_values_reshaped = old_state_values.view(-1, N)
-            else:
-                old_state_values_reshaped = old_state_values
-
-            advantages, returns = self.compute_advantages(rewards, old_state_values_reshaped, is_terms)
+            
+            # Reshape for GAE computation: (T, N) where T=timesteps, N=num_envs
+            N = rewards.size(1)
+            old_state_values = old_state_values.view(-1, N)
+            
+            advantages, returns = self.compute_advantages(rewards, old_state_values, is_terms)
 
         
         dataset = TensorDataset(old_states, old_actions, old_logprobs, advantages, returns)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         
         for _ in range(self.K_epochs):
-            for batch in dataloader:
-                batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns = batch
-                
+            for batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns in dataloader:
                 actor_loss, critic_loss = self.compute_losses(
                     batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns
                 )
                 
-                # Update actor
+                # Single backward pass, separate optimizer steps
                 self.actor_optimizer.zero_grad()
-                actor_loss.backward(retain_graph=True)
-                torch.nn.utils.clip_grad_norm_(self.actor_optimizer.param_groups[0]['params'], max_norm=0.5)
-                self.actor_optimizer.step()
-
-                # Update critic  
                 self.critic_optimizer.zero_grad()
-                critic_loss.backward()
+                (actor_loss + critic_loss).backward()
+                torch.nn.utils.clip_grad_norm_(self.actor_optimizer.param_groups[0]['params'], max_norm=0.5)
                 torch.nn.utils.clip_grad_norm_(self.critic_optimizer.param_groups[0]['params'], max_norm=1.0)
+                self.actor_optimizer.step()
                 self.critic_optimizer.step()
         
-        # clear memory after update
-        self.memory.clear()
+        self.states, self.actions = [], []
 
-def rollout(env, policy, num_steps, num_envs):
-    """Collect trajectories from vectorized envs (like tiny_reinforce but vectorized)"""
+def rollout(env, policy, num_steps):
     states, _ = env.reset()
-    traj_rewards, traj_dones = [], []
-    ep_returns = []
-    ep_rets = np.zeros(num_envs)
-    timestep = 0
+    traj_rewards, traj_dones, ep_returns = [], [], []
+    n = env.num_envs
+    ep_rets = np.zeros(n)
     
-    while timestep < num_steps:
-        timestep += num_envs
+    for _ in range(0, num_steps, n):
         actions = policy(states)
-        next_states, rewards, terminated, truncated, _ = env.step(actions)
+        states, rewards, terminated, truncated, _ = env.step(actions)
         dones = np.logical_or(terminated, truncated)
         
         traj_rewards.append(rewards)
@@ -237,29 +203,18 @@ def rollout(env, policy, num_steps, num_envs):
             for idx in np.where(dones)[0]:
                 ep_returns.append(ep_rets[idx])
                 ep_rets[idx] = 0.0
-            
-            if hasattr(env, 'reset_done'):
-                next_states[dones] = env.reset_done()[0]
-            else:
-                next_states, _ = env.reset()
-                ep_rets[:] = 0.0
-        
-        states = next_states
     
     return (traj_rewards, traj_dones), ep_returns
 
-def train_one_epoch(env, ppo, steps_per_epoch, num_envs):
-    """Run one epoch: collect experience → update policy"""
-    (rewards, dones), ep_returns = rollout(env, ppo, steps_per_epoch, num_envs)
-    ppo.store_rollout(rewards, dones)
-    ppo.update()
+def train_one_epoch(env, ppo):
+    (rewards, dones), ep_returns = rollout(env, ppo, steps_per_epoch)
+    ppo.update(rewards, dones)
     return ep_returns
 
 def train():
-    # setup
     actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, num_hidden_layers).to(device)
     ppo = PPO(actor_critic, lr_actor, lr_critic, gamma, gae_lambda, K_epochs, eps_clip, batch_size)
-    env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name) for _ in range(num_envs)])
+    env = make_env(num_envs)
     
     all_episode_returns = []
     last_eval = float('-inf')
@@ -269,45 +224,29 @@ def train():
         fig, ax = plt.subplots()
     
     pbar = trange(max_epochs, desc="Training", unit='epoch')
-    pbar.write("epoch | n_ep | ep_ret_mean | ep_ret_std | train_100 |    eval |  std")
-    pbar.write("-" * 75)
     
-    # main training loop
     for epoch in range(max_epochs):
-        epoch_returns = train_one_epoch(env, ppo, steps_per_epoch, num_envs)
-        all_episode_returns.extend(epoch_returns)
+        ep_rets = train_one_epoch(env, ppo)
+        all_episode_returns.extend(ep_rets)
         pbar.update(1)
         
-        # logging
-        n_ep = len(epoch_returns)
-        ep_mean = np.mean(epoch_returns) if epoch_returns else 0.0
-        ep_std = np.std(epoch_returns) if epoch_returns else 0.0
         train_100 = np.mean(all_episode_returns[-100:]) if all_episode_returns else 0.0
         
         if (epoch + 1) % eval_interval == 0:
-            eval_ret = evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=num_envs)
-            last_eval = eval_ret
-            std = actor_critic.log_std.exp().detach().cpu().numpy()
-            pbar.write(f"{epoch+1:5d} | {n_ep:4d} | {ep_mean:11.2f} | {ep_std:10.2f} | {train_100:9.2f} | {eval_ret:7.2f} | [{std[0]:.2f},{std[1]:.2f}]")
-            
+            last_eval = evaluate_policy(actor_critic)
             if RENDER:
-                evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=1, render=True)
-            
-            if train_100 >= solved_threshold:
-                pbar.write(f"{'='*75}\nSOLVED at epoch {epoch+1}! train_100={train_100:.2f}, eval={eval_ret:.2f}\n{'='*75}")
-                break
+                evaluate_policy(actor_critic, render=True)
         
-        elif (epoch + 1) % log_interval == 0:
-            pbar.write(f"{epoch+1:5d} | {n_ep:4d} | {ep_mean:11.2f} | {ep_std:10.2f} | {train_100:9.2f} | {last_eval:7.2f}")
+        if (epoch + 1) % log_interval == 0:
+            s = actor_critic.log_std.exp().detach().cpu().numpy()
+            pbar.write(f"Epoch {epoch+1}: n_ep={len(ep_rets)}, ret={np.mean(ep_rets):.1f}±{np.std(ep_rets):.1f}, train_100={train_100:.1f}, eval={last_eval:.1f}, σ=[{s[0]:.2f},{s[1]:.2f}]")
+        
+        if train_100 >= solved_threshold:  # success = rolling 100-episode average crosses threshold
+            pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch+1}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
+            break
         
         if PLOT and (epoch + 1) % (log_interval * 2) == 0:
-            ax.clear()
-            ax.plot(all_episode_returns, alpha=0.3, label='Episode Returns')
-            if len(all_episode_returns) >= 100:
-                ma = np.convolve(all_episode_returns, np.ones(100)/100, mode='valid')
-                ax.plot(range(99, len(all_episode_returns)), ma, label='100-ep MA', linewidth=2)
-            ax.axhline(solved_threshold, color='red', linestyle='--', alpha=0.5, label=f'Solved ({solved_threshold})')
-            ax.legend(); ax.set_xlabel('Episode'); ax.set_ylabel('Return'); plt.pause(0.01)
+            update_plot(ax, all_episode_returns, solved_threshold)
     
     env.close()
     pbar.close()
@@ -315,21 +254,17 @@ def train():
         plt.ioff()
         plt.show()
 
-def evaluate_policy(env_name, actor_critic, max_timesteps, num_envs=16, render=False):
-    """Evaluate policy deterministically using rollout abstraction"""
-    render_mode = 'human' if render else None
-    env = gym.vector.AsyncVectorEnv([lambda: gym.make(env_name, render_mode=render_mode) for _ in range(num_envs)])
+def evaluate_policy(actor_critic, n=16, render=False):
+    n = 1 if render else n
+    env = make_env(n, render)
     actor_critic.eval()
     
-    _, ep_rets = rollout(env, actor_critic.act_deterministic, max_timesteps * num_envs, num_envs)
+    _, ep_rets = rollout(env, actor_critic.act_deterministic, max_timesteps * n)
     
     env.close()
     actor_critic.train()
     
-    if not ep_rets:
-        return 0.0
-    # average first num_envs episodes (one per env)
-    return float(np.mean(ep_rets[:num_envs]))
+    return float(np.mean(ep_rets)) if ep_rets else 0.0
 
 if __name__ == '__main__':
     train()
