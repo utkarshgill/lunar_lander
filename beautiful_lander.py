@@ -15,12 +15,14 @@ num_envs = int(os.getenv('NUM_ENVS', 10))
 # https://gymnasium.farama.org/environments/box2d/lunar_lander/#:~:text=For%20the%20default%20values%20of%20VIEWPORT_W%2C%20VIEWPORT_H%2C%20SCALE%2C%20and%20FPS%2C%20the%20scale%20factors%20equal%3A%20%E2%80%98x%E2%80%99%3A%2010%2C%20%E2%80%98y%E2%80%99%3A%206.666%2C%20%E2%80%98vx%E2%80%99%3A%205%2C%20%E2%80%98vy%E2%80%99%3A%207.5%2C%20%E2%80%98angle%E2%80%99%3A%201%2C%20%E2%80%98angular%20velocity%E2%80%99%3A%202.5
 OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
 
-max_epochs, max_timesteps, steps_per_epoch = 200, 1000, 10_000
-log_interval, eval_interval = 10, 20
+max_epochs, max_timesteps, steps_per_epoch = 100, 1000, 50_000
+log_interval, eval_interval = 5, 10
 batch_size, K_epochs = 128, 10
-hidden_dim, num_hidden_layers = 256, 2
-lr_actor, lr_critic = 1e-4, 5e-4
+trunk_dim, hidden_dim = 32, 64
+num_hidden_trunk, num_hidden_layers = 1, 3
+lr = 3e-4
 gamma, gae_lambda, eps_clip = 0.99, 0.95, 0.2
+entropy_coef = 0.001
 solved_threshold = 250
 
 PLOT = bool(int(os.getenv('PLOT', '0')))
@@ -52,63 +54,99 @@ def tanh_log_prob(raw_action, dist):
     return logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim, num_hidden_layers):
+    def __init__(self, state_dim, action_dim, trunk_dim, hidden_dim, num_hidden_trunk, num_hidden_layers):
         super(ActorCritic, self).__init__()
         
-        # Actor
-        actor_layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
-        for _ in range(num_hidden_layers - 1):
-            actor_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-        self.actor = nn.Sequential(*actor_layers)
+        # Shared trunk (configurable depth and width)
+        trunk_layers = [nn.LayerNorm(state_dim), nn.Linear(state_dim, trunk_dim), nn.ReLU()]
+        for _ in range(num_hidden_trunk - 1):
+            trunk_layers.extend([nn.LayerNorm(trunk_dim), nn.Linear(trunk_dim, trunk_dim), nn.ReLU()])
+        self.trunk = nn.Sequential(*trunk_layers)
+        
+        # Projection from trunk to heads (if dimensions differ)
+        self.trunk_to_actor = nn.Linear(trunk_dim, hidden_dim) if trunk_dim != hidden_dim else nn.Identity()
+        self.trunk_to_critic = nn.Linear(trunk_dim, hidden_dim) if trunk_dim != hidden_dim else nn.Identity()
+        
+        # Actor head (Pre-LN: normalize before compute)
+        actor_layers = []
+        for _ in range(num_hidden_layers):
+            actor_layers.extend([
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU()
+            ])
+        self.actor_layers = nn.Sequential(*actor_layers)
         self.actor_mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         
-        # Critic
-        critic_layers = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
-        for _ in range(num_hidden_layers - 1):
-            critic_layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-        self.critic = nn.Sequential(*critic_layers)
+        # Critic head (Pre-LN: normalize before compute)
+        critic_layers = []
+        for _ in range(num_hidden_layers):
+            critic_layers.extend([
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU()
+            ])
+        self.critic_layers = nn.Sequential(*critic_layers)
         self.critic_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, state):
-        action_mean = self.actor_mean(self.actor(state))
+        trunk_features = self.trunk(state)
+        
+        # Actor: task-specific processing
+        actor_feat = self.actor_layers(self.trunk_to_actor(trunk_features))
+        action_mean = self.actor_mean(actor_feat)
         action_std = self.log_std.exp()
-        value = self.critic_out(self.critic(state))
+        
+        # Critic: task-specific processing
+        critic_feat = self.critic_layers(self.trunk_to_critic(trunk_features))
+        value = self.critic_out(critic_feat)
+        
         return action_mean, action_std, value
     
+    def preprocess(self, state):
+        return torch.as_tensor(state * OBS_SCALE, dtype=torch.float32).to(device)
+    
     @torch.no_grad()
-    def act_deterministic(self, state):
-        state_tensor = torch.as_tensor(state * OBS_SCALE, dtype=torch.float32).to(device)
-        mean, _, _ = self(state_tensor)
-        return torch.tanh(mean).cpu().numpy()
+    def act(self, state, deterministic=False, return_internals=False):
+        state_tensor = self.preprocess(state)
+        action_mean, action_std, _ = self(state_tensor)
+        
+        if deterministic:
+            raw_action = action_mean
+            action = torch.tanh(action_mean)
+        else:
+            dist = torch.distributions.Normal(action_mean, action_std)
+            raw_action = dist.sample()
+            action = torch.tanh(raw_action)
+        
+        if return_internals:
+            return action.cpu().numpy(), state_tensor, raw_action
+        return action.cpu().numpy()
 
 class PPO:
-    def __init__(self, actor_critic, lr_actor, lr_critic, gamma, lamda, K_epochs, eps_clip, batch_size):
+    def __init__(self, actor_critic, lr, gamma, lamda, K_epochs, eps_clip, batch_size, entropy_coef):
         self.actor_critic = actor_critic
         self.states, self.actions = [], []
-        
-        # Separate optimizers for actor and critic
-        actor_params = [*actor_critic.actor.parameters(), *actor_critic.actor_mean.parameters(), actor_critic.log_std]
-        critic_params = [*actor_critic.critic.parameters(), *actor_critic.critic_out.parameters()]
-        self.actor_optimizer = optim.Adam(actor_params, lr=lr_actor)
-        self.critic_optimizer = optim.Adam(critic_params, lr=lr_critic)
+        self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
         self.gamma = gamma
         self.lamda = lamda
         self.K_epochs = K_epochs
         self.eps_clip = eps_clip
         self.batch_size = batch_size
+        self.entropy_coef = entropy_coef
 
-    @torch.no_grad()
     def __call__(self, state):
-        state_tensor = torch.as_tensor(state * OBS_SCALE, dtype=torch.float32).to(device)
-        action_mean, action_std, _ = self.actor_critic(state_tensor)
-        dist = torch.distributions.Normal(action_mean, action_std)
-        raw_action = dist.sample()
-        
-        self.states.append(state_tensor)  # logprobs computed later in update()
+        action_np, state_tensor, raw_action = self.actor_critic.act(
+            state, deterministic=False, return_internals=True
+        )
+        self.states.append(state_tensor)
         self.actions.append(raw_action)
-        
-        return torch.tanh(raw_action).cpu().numpy()
+        return action_np
 
     def compute_advantages(self, rewards, state_values, is_terminals):
         T, N = rewards.shape
@@ -130,10 +168,10 @@ class PPO:
         action_means, action_stds, state_values = self.actor_critic(batch_states)
         dist = torch.distributions.Normal(action_means, action_stds)
         action_logprobs = tanh_log_prob(batch_actions, dist)
-        state_values = state_values.squeeze()
+        state_values = state_values.squeeze(-1)
         
         # PPO actor loss with clipping
-        ratios = torch.exp(action_logprobs - batch_logprobs.detach())
+        ratios = torch.exp(action_logprobs - batch_logprobs)
         surr1 = ratios * batch_advantages
         surr2 = torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages
         actor_loss = -torch.min(surr1, surr2).mean()
@@ -141,7 +179,10 @@ class PPO:
         # Critic loss
         critic_loss = F.mse_loss(state_values, batch_returns)
         
-        return actor_loss, critic_loss
+        # Entropy bonus (maximize entropy = minimize -entropy)
+        entropy = dist.entropy().sum(-1).mean()
+        
+        return actor_loss + critic_loss - self.entropy_coef * entropy
     
     def update(self, rewards, dones):
         with torch.no_grad():
@@ -162,25 +203,20 @@ class PPO:
             old_state_values = old_state_values.view(-1, N)
             
             advantages, returns = self.compute_advantages(rewards, old_state_values, is_terms)
-
         
         dataset = TensorDataset(old_states, old_actions, old_logprobs, advantages, returns)
         dataloader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
         
         for _ in range(self.K_epochs):
             for batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns in dataloader:
-                actor_loss, critic_loss = self.compute_losses(
+                loss = self.compute_losses(
                     batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns
                 )
                 
-                # Single backward pass, separate optimizer steps
-                self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                (actor_loss + critic_loss).backward()
-                torch.nn.utils.clip_grad_norm_(self.actor_optimizer.param_groups[0]['params'], max_norm=0.5)
-                torch.nn.utils.clip_grad_norm_(self.critic_optimizer.param_groups[0]['params'], max_norm=1.0)
-                self.actor_optimizer.step()
-                self.critic_optimizer.step()
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=0.5)
+                self.optimizer.step()
         
         self.states, self.actions = [], []
 
@@ -190,7 +226,7 @@ def rollout(env, policy, num_steps):
     n = env.num_envs
     ep_rets = np.zeros(n)
     
-    for _ in range(0, num_steps, n):
+    for _ in range(num_steps // n):
         actions = policy(states)
         states, rewards, terminated, truncated, _ = env.step(actions)
         dones = np.logical_or(terminated, truncated)
@@ -204,16 +240,16 @@ def rollout(env, policy, num_steps):
                 ep_returns.append(ep_rets[idx])
                 ep_rets[idx] = 0.0
     
-    return (traj_rewards, traj_dones), ep_returns
+    return traj_rewards, traj_dones, ep_returns
 
 def train_one_epoch(env, ppo):
-    (rewards, dones), ep_returns = rollout(env, ppo, steps_per_epoch)
+    rewards, dones, ep_returns = rollout(env, ppo, steps_per_epoch)
     ppo.update(rewards, dones)
     return ep_returns
 
 def train():
-    actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, num_hidden_layers).to(device)
-    ppo = PPO(actor_critic, lr_actor, lr_critic, gamma, gae_lambda, K_epochs, eps_clip, batch_size)
+    actor_critic = ActorCritic(state_dim, action_dim, trunk_dim, hidden_dim, num_hidden_trunk, num_hidden_layers).to(device)
+    ppo = PPO(actor_critic, lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, entropy_coef)
     env = make_env(num_envs)
     
     all_episode_returns = []
@@ -259,7 +295,10 @@ def evaluate_policy(actor_critic, n=16, render=False):
     env = make_env(n, render)
     actor_critic.eval()
     
-    _, ep_rets = rollout(env, actor_critic.act_deterministic, max_timesteps * n)
+    def policy(state):
+        return actor_critic.act(state, deterministic=True)
+    
+    _, _, ep_rets = rollout(env, policy, max_timesteps * n)
     
     env.close()
     actor_critic.train()
