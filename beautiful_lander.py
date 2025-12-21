@@ -13,17 +13,17 @@ warnings.filterwarnings('ignore', message='pkg_resources is deprecated')
 
 env_name = 'LunarLanderContinuous-v3'
 state_dim, action_dim = 8, 2
-num_envs = int(os.getenv('NUM_ENVS', 20))
+num_envs = int(os.getenv('NUM_ENVS', 8))
 
 # https://gymnasium.farama.org/environments/box2d/lunar_lander/#:~:text=For%20the%20default%20values%20of%20VIEWPORT_W%2C%20VIEWPORT_H%2C%20SCALE%2C%20and%20FPS%2C%20the%20scale%20factors%20equal%3A%20%E2%80%98x%E2%80%99%3A%2010%2C%20%E2%80%98y%E2%80%99%3A%206.666%2C%20%E2%80%98vx%E2%80%99%3A%205%2C%20%E2%80%98vy%E2%80%99%3A%207.5%2C%20%E2%80%98angle%E2%80%99%3A%201%2C%20%E2%80%98angular%20velocity%E2%80%99%3A%202.5
 OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
 
 max_epochs, max_timesteps, steps_per_epoch = 100, 1000, 100_000
 log_interval, eval_interval = 5, 10
-batch_size, K_epochs = 128, 10
-trunk_dim, hidden_dim = 64, 128
-num_hidden_trunk, num_hidden_layers = 1, 3
-lr = 3e-4
+batch_size, K_epochs = 10_000, 10
+hidden_dim = 128
+trunk_layers, head_layers = 1, 3
+lr = 1e-3
 gamma, gae_lambda, eps_clip = 0.99, 0.95, 0.2
 entropy_coef = 0.001
 solved_threshold = 250
@@ -57,53 +57,38 @@ def tanh_log_prob(raw_action, dist):
     return logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, trunk_dim, hidden_dim, num_hidden_trunk, num_hidden_layers):
+    def __init__(self, state_dim, action_dim, hidden_dim, trunk_layers, head_layers):
         super(ActorCritic, self).__init__()
         
-        # Shared trunk (configurable depth and width)
-        trunk_layers = [nn.LayerNorm(state_dim), nn.Linear(state_dim, trunk_dim), nn.ReLU()]
-        for _ in range(num_hidden_trunk - 1):
-            trunk_layers.extend([nn.LayerNorm(trunk_dim), nn.Linear(trunk_dim, trunk_dim), nn.ReLU()])
-        self.trunk = nn.Sequential(*trunk_layers)
+        # Shared trunk
+        trunk = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
+        for _ in range(trunk_layers - 1):
+            trunk.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        self.trunk = nn.Sequential(*trunk)
         
-        # Projection from trunk to heads (if dimensions differ)
-        self.trunk_to_actor = nn.Linear(trunk_dim, hidden_dim) if trunk_dim != hidden_dim else nn.Identity()
-        self.trunk_to_critic = nn.Linear(trunk_dim, hidden_dim) if trunk_dim != hidden_dim else nn.Identity()
-        
-        # Actor head (Pre-LN: 2 layers per iteration)
-        actor_layers = [layer for _ in range(num_hidden_layers) 
-                       for layer in [nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-                                    nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]]
-        self.actor_layers = nn.Sequential(*actor_layers)
+        # Actor head
+        self.actor_layers = nn.Sequential(*[layer for _ in range(head_layers)
+                                           for layer in [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]])
         self.actor_mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         
-        # Critic head (Pre-LN: 1 layer per iteration)
-        critic_layers = [layer for _ in range(num_hidden_layers)
-                        for layer in [nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]]
-        self.critic_layers = nn.Sequential(*critic_layers)
+        # Critic head
+        self.critic_layers = nn.Sequential(*[layer for _ in range(head_layers)
+                                            for layer in [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]])
         self.critic_out = nn.Linear(hidden_dim, 1)
 
     def forward(self, state):
         trunk_features = self.trunk(state)
-        
-        # Actor: task-specific processing
-        actor_feat = self.actor_layers(self.trunk_to_actor(trunk_features))
+        actor_feat = self.actor_layers(trunk_features)
         action_mean = self.actor_mean(actor_feat)
         action_std = self.log_std.exp()
-        
-        # Critic: task-specific processing
-        critic_feat = self.critic_layers(self.trunk_to_critic(trunk_features))
+        critic_feat = self.critic_layers(trunk_features)
         value = self.critic_out(critic_feat)
-        
         return action_mean, action_std, value
-    
-    def preprocess(self, state):
-        return torch.as_tensor(state * OBS_SCALE, dtype=torch.float32).to(device)
     
     @torch.no_grad()
     def act(self, state, deterministic=False, return_internals=False):
-        state_tensor = self.preprocess(state)
+        state_tensor = torch.as_tensor(state * OBS_SCALE, dtype=torch.float32).to(device)
         action_mean, action_std, _ = self(state_tensor)
         raw_action = action_mean if deterministic else torch.distributions.Normal(action_mean, action_std).sample()
         action = torch.tanh(raw_action)
@@ -187,9 +172,17 @@ def train_one_epoch(env, ppo):
     return ep_rets
 
 def train():
-    actor_critic = ActorCritic(state_dim, action_dim, trunk_dim, hidden_dim, num_hidden_trunk, num_hidden_layers).to(device)
+    actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, trunk_layers, head_layers).to(device)
     ppo, env = PPO(actor_critic, lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, entropy_coef), make_env(num_envs)
+    env_viz = make_env(1, render=True) if RENDER else None
     all_episode_returns, last_eval = [], float('-inf')
+    
+    def render_policy():
+        nonlocal env_viz
+        if env_viz is None:
+            env_viz = make_env(1, render=True)
+        evaluate_policy(actor_critic, render=True, num_episodes=RENDER_EPISODES, env=env_viz)
+    
     if PLOT:
         plt.ion()
         fig, ax = plt.subplots()
@@ -199,31 +192,38 @@ def train():
         all_episode_returns.extend(ep_rets)
         pbar.update(1)
         train_100 = np.mean(all_episode_returns[-100:]) if all_episode_returns else 0.0
-        if (epoch + 1) % eval_interval == 0:
+        if epoch % eval_interval == 0:
             last_eval = evaluate_policy(actor_critic)
             if RENDER:
-                evaluate_policy(actor_critic, render=True, num_episodes=RENDER_EPISODES)
-        if (epoch + 1) % log_interval == 0:
+                render_policy()
+        if epoch % log_interval == 0:
             s = actor_critic.log_std.exp().detach().cpu().numpy()
-            pbar.write(f"Epoch {epoch+1:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  train_100={train_100:6.1f}  eval={last_eval:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]")
+            pbar.write(f"Epoch {epoch:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  train_100={train_100:6.1f}  eval={last_eval:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]")
         if train_100 >= solved_threshold:
-            pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch+1}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
+            pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
+            render_policy()
             break
-        if PLOT and (epoch + 1) % (log_interval * 2) == 0:
+        if PLOT and epoch % (log_interval * 2) == 0:
             update_plot(ax, all_episode_returns, solved_threshold)
     env.close()
+    if env_viz is not None:
+        env_viz.close()
     pbar.close()
     if PLOT:
         plt.ioff()
         plt.show()
 
-def evaluate_policy(actor_critic, n=16, render=False, num_episodes=None):
-    env = make_env(1 if render else n, render)
-    actor_critic.eval()
+def evaluate_policy(actor_critic, n=16, render=False, num_episodes=None, env=None):
+    close_env = env is None
+    if env is None:
+        env = make_env(1 if render else n, render)
     def policy(s): return actor_critic.act(s, deterministic=True)
-    _, _, ep_rets = rollout(env, policy, num_episodes=num_episodes) if render and num_episodes else rollout(env, policy, num_steps=max_timesteps * (1 if render else n))
-    env.close()
-    actor_critic.train()
+    if render and num_episodes:
+        _, _, ep_rets = rollout(env, policy, num_episodes=num_episodes)
+    else:
+        _, _, ep_rets = rollout(env, policy, num_steps=max_timesteps * (1 if render else n))
+    if close_env:
+        env.close()
     return float(np.mean(ep_rets)) if ep_rets else 0.0
 
 if __name__ == '__main__':
