@@ -20,9 +20,9 @@ OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
 
 max_epochs, max_timesteps, steps_per_epoch = 100, 1000, 100_000
 log_interval, eval_interval = 5, 10
-batch_size, K_epochs = 10_000, 10
+batch_size, K_epochs = 5000, 20
 hidden_dim = 128
-trunk_layers, head_layers = 1, 3
+trunk_layers, head_layers = 3, 4
 lr = 1e-3
 gamma, gae_lambda, eps_clip = 0.99, 0.95, 0.2
 entropy_coef = 0.001
