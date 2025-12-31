@@ -22,10 +22,10 @@ max_epochs, max_timesteps, steps_per_epoch = 100, 1000, 100_000
 log_interval, eval_interval = 5, 10
 batch_size, K_epochs = 5000, 20
 hidden_dim = 128
-trunk_layers, head_layers = 3, 4
-lr = 1e-3
+actor_layers, critic_layers = 8, 4
+pi_lr, vf_lr = 3e-4, 1e-3
 gamma, gae_lambda, eps_clip = 0.99, 0.95, 0.2
-entropy_coef = 0.001
+vf_coef, entropy_coef = 0.5, 0.001
 solved_threshold = 250
 
 PLOT = bool(int(os.getenv('PLOT', '0')))
@@ -57,33 +57,28 @@ def tanh_log_prob(raw_action, dist):
     return logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
 
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_dim, trunk_layers, head_layers):
+    def __init__(self, state_dim, action_dim, hidden_dim, actor_layers, critic_layers):
         super(ActorCritic, self).__init__()
         
-        # Shared trunk
-        trunk = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
-        for _ in range(trunk_layers - 1):
-            trunk.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-        self.trunk = nn.Sequential(*trunk)
-        
-        # Actor head
-        self.actor_layers = nn.Sequential(*[layer for _ in range(head_layers)
-                                           for layer in [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]])
-        self.actor_mean = nn.Linear(hidden_dim, action_dim)
+        # Actor network (complete, outputs action mean)
+        actor = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
+        for _ in range(actor_layers - 1):
+            actor.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        actor.append(nn.Linear(hidden_dim, action_dim))
+        self.actor = nn.Sequential(*actor)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         
-        # Critic head
-        self.critic_layers = nn.Sequential(*[layer for _ in range(head_layers)
-                                            for layer in [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]])
-        self.critic_out = nn.Linear(hidden_dim, 1)
+        # Critic network (complete, outputs value)
+        critic = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
+        for _ in range(critic_layers - 1):
+            critic.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+        critic.append(nn.Linear(hidden_dim, 1))
+        self.critic = nn.Sequential(*critic)
 
     def forward(self, state):
-        trunk_features = self.trunk(state)
-        actor_feat = self.actor_layers(trunk_features)
-        action_mean = self.actor_mean(actor_feat)
+        action_mean = self.actor(state)
         action_std = self.log_std.exp()
-        critic_feat = self.critic_layers(trunk_features)
-        value = self.critic_out(critic_feat)
+        value = self.critic(state)
         return action_mean, action_std, value
     
     @torch.no_grad()
@@ -95,11 +90,12 @@ class ActorCritic(nn.Module):
         return (action.cpu().numpy(), state_tensor, raw_action) if return_internals else action.cpu().numpy()
 
 class PPO:
-    def __init__(self, actor_critic, lr, gamma, lamda, K_epochs, eps_clip, batch_size, entropy_coef):
+    def __init__(self, actor_critic, pi_lr, vf_lr, gamma, lamda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef):
         self.actor_critic, self.states, self.actions = actor_critic, [], []
-        self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
+        self.pi_optimizer = optim.Adam(list(actor_critic.actor.parameters()) + [actor_critic.log_std], lr=pi_lr)
+        self.vf_optimizer = optim.Adam(actor_critic.critic.parameters(), lr=vf_lr)
         self.gamma, self.lamda, self.K_epochs = gamma, lamda, K_epochs
-        self.eps_clip, self.batch_size, self.entropy_coef = eps_clip, batch_size, entropy_coef
+        self.eps_clip, self.batch_size, self.vf_coef, self.entropy_coef = eps_clip, batch_size, vf_coef, entropy_coef
 
     def __call__(self, state):
         action_np, state_tensor, raw_action = self.actor_critic.act(state, deterministic=False, return_internals=True)
@@ -119,16 +115,16 @@ class PPO:
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         return advantages.reshape(-1), returns.reshape(-1)
     
-    def compute_losses(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
+    def compute_loss(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
         action_means, action_stds, state_values = self.actor_critic(batch_states)
         dist = torch.distributions.Normal(action_means, action_stds)
         action_logprobs = tanh_log_prob(batch_actions, dist)
         ratios = torch.exp(action_logprobs - batch_logprobs)
-        actor_loss = -torch.min(ratios * batch_advantages, 
-                                torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * batch_advantages).mean()
+        # PPO clipped surrogate objective: L = L_CLIP + c1·L_VF - c2·S[π]
+        actor_loss = -torch.min(ratios * batch_advantages, torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * batch_advantages).mean()
         critic_loss = F.mse_loss(state_values.squeeze(-1), batch_returns)
         entropy = dist.entropy().sum(-1).mean()
-        return actor_loss + critic_loss - self.entropy_coef * entropy
+        return actor_loss + self.vf_coef * critic_loss - self.entropy_coef * entropy
     
     def update(self, rewards, dones):
         with torch.no_grad():
@@ -142,10 +138,26 @@ class PPO:
         dataset = TensorDataset(old_states, old_actions, old_logprobs, advantages, returns)
         for _ in range(self.K_epochs):
             for batch in DataLoader(dataset, batch_size=self.batch_size, shuffle=True):
-                self.optimizer.zero_grad()
-                self.compute_losses(*batch).backward()
-                torch.nn.utils.clip_grad_norm_(self.actor_critic.parameters(), max_norm=0.5)
-                self.optimizer.step()
+                batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns = batch
+                
+                # Zero gradients for both optimizers
+                self.pi_optimizer.zero_grad()
+                self.vf_optimizer.zero_grad()
+                
+                # Compute total PPO loss and backpropagate
+                loss = self.compute_loss(batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns)
+                loss.backward()
+                
+                # Clip gradients for both networks
+                torch.nn.utils.clip_grad_norm_(
+                    list(self.actor_critic.actor.parameters()) + [self.actor_critic.log_std], 
+                    max_norm=0.5
+                )
+                torch.nn.utils.clip_grad_norm_(self.actor_critic.critic.parameters(), max_norm=0.5)
+                
+                # Update both networks with their respective learning rates
+                self.pi_optimizer.step()
+                self.vf_optimizer.step()
         self.states, self.actions = [], []
 
 def rollout(env, policy, num_steps=None, num_episodes=None):
@@ -166,52 +178,68 @@ def rollout(env, policy, num_steps=None, num_episodes=None):
             break
     return traj_rewards, traj_dones, ep_returns
 
-def train_one_epoch(env, ppo):
-    rewards, dones, ep_rets = rollout(env, ppo, num_steps=steps_per_epoch)
-    ppo.update(rewards, dones)
-    return ep_rets
+class TrainingContext:
+    """Encapsulates all training state and resources"""
+    def __init__(self):
+        self.actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, actor_layers, critic_layers).to(device)
+        self.ppo = PPO(self.actor_critic, pi_lr, vf_lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef)
+        self.env = make_env(num_envs)
+        self.all_episode_returns = []
+        self.last_eval = float('-inf')
+        self.pbar = trange(max_epochs, desc="Training", unit='epoch')
+        if PLOT:
+            plt.ion()
+            self.fig, self.ax = plt.subplots()
+        else:
+            self.fig, self.ax = None, None
+    
+    def cleanup(self):
+        self.env.close()
+        self.pbar.close()
+        if PLOT:
+            plt.ioff()
+            plt.show()
+
+def train_one_epoch(epoch, ctx):
+    # Core training
+    rewards, dones, ep_rets = rollout(ctx.env, ctx.ppo, num_steps=steps_per_epoch)
+    ctx.ppo.update(rewards, dones)
+    ctx.all_episode_returns.extend(ep_rets)
+    ctx.pbar.update(1)
+    
+    # Compute metrics
+    train_100 = np.mean(ctx.all_episode_returns[-100:]) if ctx.all_episode_returns else 0.0
+    
+    # Evaluation
+    if epoch % eval_interval == 0:
+        ctx.last_eval = evaluate_policy(ctx.actor_critic)
+        if RENDER:
+            evaluate_policy(ctx.actor_critic, render=True, num_episodes=RENDER_EPISODES)
+    
+    # Logging
+    if epoch % log_interval == 0:
+        s = ctx.actor_critic.log_std.exp().detach().cpu().numpy()
+        ctx.pbar.write(f"Epoch {epoch:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  train_100={train_100:6.1f}  eval={ctx.last_eval:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]")
+    
+    # Plotting
+    if PLOT and epoch % (log_interval * 2) == 0:
+        update_plot(ctx.ax, ctx.all_episode_returns, solved_threshold)
+    
+    # Check if solved
+    if train_100 >= solved_threshold:
+        ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
+        if RENDER:
+            evaluate_policy(ctx.actor_critic, render=True, num_episodes=RENDER_EPISODES)
+        return True  # Signal to stop training
+    
+    return False  # Continue training
 
 def train():
-    actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, trunk_layers, head_layers).to(device)
-    ppo, env = PPO(actor_critic, lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, entropy_coef), make_env(num_envs)
-    env_viz = make_env(1, render=True) if RENDER else None
-    all_episode_returns, last_eval = [], float('-inf')
-    
-    def render_policy():
-        nonlocal env_viz
-        if env_viz is None:
-            env_viz = make_env(1, render=True)
-        evaluate_policy(actor_critic, render=True, num_episodes=RENDER_EPISODES, env=env_viz)
-    
-    if PLOT:
-        plt.ion()
-        fig, ax = plt.subplots()
-    pbar = trange(max_epochs, desc="Training", unit='epoch')
+    ctx = TrainingContext()
     for epoch in range(max_epochs):
-        ep_rets = train_one_epoch(env, ppo)
-        all_episode_returns.extend(ep_rets)
-        pbar.update(1)
-        train_100 = np.mean(all_episode_returns[-100:]) if all_episode_returns else 0.0
-        if epoch % eval_interval == 0:
-            last_eval = evaluate_policy(actor_critic)
-            if RENDER:
-                render_policy()
-        if epoch % log_interval == 0:
-            s = actor_critic.log_std.exp().detach().cpu().numpy()
-            pbar.write(f"Epoch {epoch:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  train_100={train_100:6.1f}  eval={last_eval:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]")
-        if train_100 >= solved_threshold:
-            pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
-            render_policy()
+        if train_one_epoch(epoch, ctx):
             break
-        if PLOT and epoch % (log_interval * 2) == 0:
-            update_plot(ax, all_episode_returns, solved_threshold)
-    env.close()
-    if env_viz is not None:
-        env_viz.close()
-    pbar.close()
-    if PLOT:
-        plt.ioff()
-        plt.show()
+    ctx.cleanup()
 
 def evaluate_policy(actor_critic, n=16, render=False, num_episodes=None, env=None):
     close_env = env is None
