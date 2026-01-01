@@ -6,14 +6,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 import os
 import warnings
-from torch.utils.data import DataLoader, TensorDataset
 from tqdm import trange
 
 warnings.filterwarnings('ignore', message='pkg_resources is deprecated')
 
 env_name = 'LunarLanderContinuous-v3'
 state_dim, action_dim = 8, 2
-num_envs = int(os.getenv('NUM_ENVS', 8))
+num_envs = int(os.getenv('NUM_ENVS', 24))
 
 # https://gymnasium.farama.org/environments/box2d/lunar_lander/#:~:text=For%20the%20default%20values%20of%20VIEWPORT_W%2C%20VIEWPORT_H%2C%20SCALE%2C%20and%20FPS%2C%20the%20scale%20factors%20equal%3A%20%E2%80%98x%E2%80%99%3A%2010%2C%20%E2%80%98y%E2%80%99%3A%206.666%2C%20%E2%80%98vx%E2%80%99%3A%205%2C%20%E2%80%98vy%E2%80%99%3A%207.5%2C%20%E2%80%98angle%E2%80%99%3A%201%2C%20%E2%80%98angular%20velocity%E2%80%99%3A%202.5
 OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
@@ -22,7 +21,7 @@ max_epochs, max_timesteps, steps_per_epoch = 100, 1000, 100_000
 log_interval, eval_interval = 5, 10
 batch_size, K_epochs = 5000, 20
 hidden_dim = 128
-actor_layers, critic_layers = 8, 4
+actor_layers, critic_layers = 5, 3
 pi_lr, vf_lr = 3e-4, 1e-3
 gamma, gae_lambda, eps_clip = 0.99, 0.95, 0.2
 vf_coef, entropy_coef = 0.5, 0.001
@@ -34,12 +33,24 @@ RENDER_EPISODES = int(os.getenv('RENDER_EPISODES', '3'))
 METAL = bool(int(os.getenv('METAL', '0')))
 
 device = torch.device('mps' if METAL and torch.backends.mps.is_available() else 'cuda' if torch.cuda.is_available() else 'cpu')
+OBS_SCALE_T_CPU = torch.tensor(OBS_SCALE, dtype=torch.float32, device='cpu')
+OBS_SCALE_T_DEVICE = torch.tensor(OBS_SCALE, dtype=torch.float32, device=device)
+
+# Reduce CPU thread contention with env stepping (only set once per process)
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass  # Already set in this process
 
 if PLOT: import matplotlib.pyplot as plt
 
 def make_env(n, render=False):
     render_mode = 'human' if render else None
-    return gym.vector.AsyncVectorEnv([lambda: gym.make(env_name, render_mode=render_mode) for _ in range(n)])
+    return gym.vector.AsyncVectorEnv(
+        [lambda: gym.make(env_name, render_mode=render_mode) for _ in range(n)],
+        # context='spawn'  # Explicit multiprocessing context for consistency
+    )
 
 def update_plot(ax, returns, threshold):
     ax.clear()
@@ -81,27 +92,24 @@ class ActorCritic(nn.Module):
         value = self.critic(state)
         return action_mean, action_std, value
     
-    @torch.no_grad()
-    def act(self, state, deterministic=False, return_internals=False):
-        state_tensor = torch.as_tensor(state * OBS_SCALE, dtype=torch.float32).to(device)
+    @torch.inference_mode()
+    def act(self, state, deterministic=False):
+        """CPU-only action selection for rollout (no MPS transfer)"""
+        dev = next(self.parameters()).device
+        scale = OBS_SCALE_T_CPU if dev.type == 'cpu' else OBS_SCALE_T_DEVICE
+        state_tensor = torch.from_numpy(state).to(device=dev, dtype=torch.float32) * scale
         action_mean, action_std, _ = self(state_tensor)
         raw_action = action_mean if deterministic else torch.distributions.Normal(action_mean, action_std).sample()
         action = torch.tanh(raw_action)
-        return (action.cpu().numpy(), state_tensor, raw_action) if return_internals else action.cpu().numpy()
+        return action.cpu().numpy(), raw_action.cpu().numpy()
 
 class PPO:
     def __init__(self, actor_critic, pi_lr, vf_lr, gamma, lamda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef):
-        self.actor_critic, self.states, self.actions = actor_critic, [], []
+        self.actor_critic = actor_critic
         self.pi_optimizer = optim.Adam(list(actor_critic.actor.parameters()) + [actor_critic.log_std], lr=pi_lr)
         self.vf_optimizer = optim.Adam(actor_critic.critic.parameters(), lr=vf_lr)
         self.gamma, self.lamda, self.K_epochs = gamma, lamda, K_epochs
         self.eps_clip, self.batch_size, self.vf_coef, self.entropy_coef = eps_clip, batch_size, vf_coef, entropy_coef
-
-    def __call__(self, state):
-        action_np, state_tensor, raw_action = self.actor_critic.act(state, deterministic=False, return_internals=True)
-        self.states.append(state_tensor)
-        self.actions.append(raw_action)
-        return action_np
 
     def compute_advantages(self, rewards, state_values, is_terminals):
         T, N = rewards.shape
@@ -126,67 +134,119 @@ class PPO:
         entropy = dist.entropy().sum(-1).mean()
         return actor_loss + self.vf_coef * critic_loss - self.entropy_coef * entropy
     
-    def update(self, rewards, dones):
+    def update(self, obs, raw_act, rew, done):
+        """Single MPS transfer, all computation on device"""
+        dev = next(self.actor_critic.parameters()).device
+        
+        # Transfer entire rollout to device ONCE
+        T, N = rew.shape
+        obs_flat = torch.from_numpy(obs.reshape(-1, state_dim)).to(device=dev, dtype=torch.float32)
+        raw_act_flat = torch.from_numpy(raw_act.reshape(-1, action_dim)).to(device=dev, dtype=torch.float32)
+        rew_t = torch.from_numpy(rew).to(device=dev, dtype=torch.float32)
+        done_t = torch.from_numpy(done).to(device=dev, dtype=torch.float32)
+        
+        # Apply OBS_SCALE to match rollout (critical for train/inference consistency)
+        scale = OBS_SCALE_T_DEVICE if dev.type != "cpu" else OBS_SCALE_T_CPU
+        obs_flat = obs_flat * scale
+        
         with torch.no_grad():
-            rewards = torch.as_tensor(np.stack(rewards), dtype=torch.float32).to(device)
-            is_terms = torch.as_tensor(np.stack(dones), dtype=torch.float32).to(device)
-            old_states, old_actions = torch.cat(self.states), torch.cat(self.actions)
-            action_means, action_stds, old_state_values = self.actor_critic(old_states)
-            old_logprobs = tanh_log_prob(old_actions, torch.distributions.Normal(action_means, action_stds))
-            old_state_values = old_state_values.squeeze(-1).view(-1, rewards.size(1))
-            advantages, returns = self.compute_advantages(rewards, old_state_values, is_terms)
-        dataset = TensorDataset(old_states, old_actions, old_logprobs, advantages, returns)
+            # Batched forward pass for old logprobs and values
+            mean, std, val = self.actor_critic(obs_flat)
+            dist = torch.distributions.Normal(mean, std)
+            old_logprobs = tanh_log_prob(raw_act_flat, dist)
+            old_values = val.squeeze(-1).view(T, N)
+            
+            # GAE on device
+            advantages, returns = self.compute_advantages(rew_t, old_values, done_t)
+        
+        # PPO epochs with tensor-based minibatching
+        num_samples = obs_flat.size(0)
         for _ in range(self.K_epochs):
-            for batch in DataLoader(dataset, batch_size=self.batch_size, shuffle=True):
-                batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns = batch
-                
-                # Zero gradients for both optimizers
+            perm = torch.randperm(num_samples, device=dev)
+            for start in range(0, num_samples, self.batch_size):
+                idx = perm[start:start + self.batch_size]
                 self.pi_optimizer.zero_grad()
                 self.vf_optimizer.zero_grad()
-                
-                # Compute total PPO loss and backpropagate
-                loss = self.compute_loss(batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns)
+                loss = self.compute_loss(obs_flat[idx], raw_act_flat[idx], old_logprobs[idx], advantages[idx], returns[idx])
                 loss.backward()
-                
-                # Clip gradients for both networks
-                torch.nn.utils.clip_grad_norm_(
-                    list(self.actor_critic.actor.parameters()) + [self.actor_critic.log_std], 
-                    max_norm=0.5
-                )
+                torch.nn.utils.clip_grad_norm_(list(self.actor_critic.actor.parameters()) + [self.actor_critic.log_std], max_norm=0.5)
                 torch.nn.utils.clip_grad_norm_(self.actor_critic.critic.parameters(), max_norm=0.5)
-                
-                # Update both networks with their respective learning rates
                 self.pi_optimizer.step()
                 self.vf_optimizer.step()
-        self.states, self.actions = [], []
 
-def rollout(env, policy, num_steps=None, num_episodes=None):
+def rollout(env, actor_critic, num_steps=None, num_episodes=None):
+    """Preallocated numpy rollout for CPU-only data collection"""
     assert (num_steps is None) != (num_episodes is None), "Specify exactly one: num_steps or num_episodes"
-    states, _ = env.reset()
-    traj_rewards, traj_dones, ep_returns, ep_rets, step_count = [], [], [], np.zeros(env.num_envs), 0
-    while True:
-        states, rewards, terminated, truncated, _ = env.step(policy(states))
-        traj_rewards.append(rewards)
-        traj_dones.append(np.logical_or(terminated, truncated))
-        ep_rets += rewards
-        step_count += env.num_envs
-        if np.any(traj_dones[-1]):
-            for idx in np.where(traj_dones[-1])[0]:
+    
+    N = env.num_envs
+    
+    if num_steps:
+        # Preallocated buffers for fixed-length rollout
+        T = num_steps // N
+        obs = np.empty((T, N, state_dim), dtype=np.float32)
+        raw_act = np.empty((T, N, action_dim), dtype=np.float32)
+        rew = np.empty((T, N), dtype=np.float32)
+        done = np.empty((T, N), dtype=np.float32)
+        
+        states, _ = env.reset()
+        ep_returns, ep_rets = [], np.zeros(N)
+        
+        for t in range(T):
+            obs[t] = states
+            actions, raw_actions = actor_critic.act(states)
+            raw_act[t] = raw_actions
+            states, rewards, terminated, truncated, _ = env.step(actions)
+            rew[t] = rewards
+            d = np.logical_or(terminated, truncated)
+            done[t] = d
+            # Note: With autoreset_mode='NextStep' (default), done envs auto-reset
+            # and states already contains the reset observations
+            ep_rets += rewards
+            for idx in np.where(d)[0]:
                 ep_returns.append(ep_rets[idx])
                 ep_rets[idx] = 0.0
-        if (num_steps and step_count >= num_steps) or (num_episodes and len(ep_returns) >= num_episodes):
-            break
-    return traj_rewards, traj_dones, ep_returns
+        
+        return obs, raw_act, rew, done, ep_returns
+    else:
+        # Variable-length rollout for eval (list-based)
+        states, _ = env.reset()
+        traj_rewards, traj_dones, ep_returns, ep_rets, count = [], [], [], np.zeros(N), 0
+        while True:
+            actions, _ = actor_critic.act(states)
+            states, rewards, terminated, truncated, _ = env.step(actions)
+            traj_rewards.append(rewards)
+            d = np.logical_or(terminated, truncated)
+            traj_dones.append(d)
+            # With autoreset_mode='NextStep', done envs auto-reset
+            ep_rets += rewards
+            count += N
+            for idx in np.where(d)[0]:
+                ep_returns.append(ep_rets[idx])
+                ep_rets[idx] = 0.0
+            if len(ep_returns) >= num_episodes:
+                break
+        return traj_rewards, traj_dones, ep_returns
 
 class TrainingContext:
     """Encapsulates all training state and resources"""
     def __init__(self):
-        self.actor_critic = ActorCritic(state_dim, action_dim, hidden_dim, actor_layers, critic_layers).to(device)
-        self.ppo = PPO(self.actor_critic, pi_lr, vf_lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef)
+        # Dual models: CPU for rollout, device (MPS/CUDA) for update
+        self.ac_cpu = ActorCritic(state_dim, action_dim, hidden_dim, actor_layers, critic_layers).to('cpu')
+        self.ac_device = ActorCritic(state_dim, action_dim, hidden_dim, actor_layers, critic_layers).to(device)
+        self.ppo = PPO(self.ac_device, pi_lr, vf_lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef)
+        
+        # Reusable environments
         self.env = make_env(num_envs)
+        self.eval_env = make_env(16)  # Reused for evaluation
+        
         self.all_episode_returns = []
         self.last_eval = float('-inf')
         self.pbar = trange(max_epochs, desc="Training", unit='epoch')
+        
+        # Timing stats
+        self.rollout_times = []
+        self.update_times = []
+        
         if PLOT:
             plt.ion()
             self.fig, self.ax = plt.subplots()
@@ -195,31 +255,49 @@ class TrainingContext:
     
     def cleanup(self):
         self.env.close()
+        self.eval_env.close()
         self.pbar.close()
         if PLOT:
             plt.ioff()
             plt.show()
 
 def train_one_epoch(epoch, ctx):
-    # Core training
-    rewards, dones, ep_rets = rollout(ctx.env, ctx.ppo, num_steps=steps_per_epoch)
-    ctx.ppo.update(rewards, dones)
+    import time
+    
+    # Sync weights from device to CPU for rollout
+    ctx.ac_cpu.load_state_dict(ctx.ac_device.state_dict())
+    
+    # CPU rollout with timing
+    t0 = time.perf_counter()
+    obs, raw_act, rew, done, ep_rets = rollout(ctx.env, ctx.ac_cpu, num_steps=steps_per_epoch)
+    t1 = time.perf_counter()
+    ctx.rollout_times.append(t1 - t0)
+    
+    # MPS update with timing
+    t0 = time.perf_counter()
+    ctx.ppo.update(obs, raw_act, rew, done)
+    t1 = time.perf_counter()
+    ctx.update_times.append(t1 - t0)
+    
     ctx.all_episode_returns.extend(ep_rets)
     ctx.pbar.update(1)
     
     # Compute metrics
     train_100 = np.mean(ctx.all_episode_returns[-100:]) if ctx.all_episode_returns else 0.0
     
-    # Evaluation
+    # Evaluation (CPU only, reused env)
     if epoch % eval_interval == 0:
-        ctx.last_eval = evaluate_policy(ctx.actor_critic)
+        ctx.last_eval = evaluate_policy(ctx.ac_cpu, env=ctx.eval_env)
         if RENDER:
-            evaluate_policy(ctx.actor_critic, render=True, num_episodes=RENDER_EPISODES)
+            evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
     
     # Logging
     if epoch % log_interval == 0:
-        s = ctx.actor_critic.log_std.exp().detach().cpu().numpy()
-        ctx.pbar.write(f"Epoch {epoch:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  train_100={train_100:6.1f}  eval={ctx.last_eval:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]")
+        s = ctx.ac_device.log_std.exp().detach().cpu().numpy()
+        rollout_ms = np.mean(ctx.rollout_times[-log_interval:]) * 1000
+        update_ms = np.mean(ctx.update_times[-log_interval:]) * 1000
+        total_ms = rollout_ms + update_ms
+        ctx.pbar.write(f"Epoch {epoch:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  train_100={train_100:6.1f}  eval={ctx.last_eval:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]  ⏱ {total_ms:.0f}ms (rollout:{rollout_ms:.0f}ms update:{update_ms:.0f}ms)")
     
     # Plotting
     if PLOT and epoch % (log_interval * 2) == 0:
@@ -229,7 +307,7 @@ def train_one_epoch(epoch, ctx):
     if train_100 >= solved_threshold:
         ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
         if RENDER:
-            evaluate_policy(ctx.actor_critic, render=True, num_episodes=RENDER_EPISODES)
+            evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
         return True  # Signal to stop training
     
     return False  # Continue training
@@ -245,15 +323,29 @@ def evaluate_policy(actor_critic, n=16, render=False, num_episodes=None, env=Non
     close_env = env is None
     if env is None:
         env = make_env(1 if render else n, render)
-    def policy(s): return actor_critic.act(s, deterministic=True)
+    
+    # Use deterministic policy
+    prev_train = actor_critic.training
+    actor_critic.eval()
+    
     if render and num_episodes:
-        _, _, ep_rets = rollout(env, policy, num_episodes=num_episodes)
+        _, _, ep_rets = rollout(env, actor_critic, num_episodes=num_episodes)
     else:
-        _, _, ep_rets = rollout(env, policy, num_steps=max_timesteps * (1 if render else n))
+        _, _, ep_rets = rollout(env, actor_critic, num_episodes=n)  # Fixed number of episodes for eval
+    
+    actor_critic.train(prev_train)
     if close_env:
         env.close()
     return float(np.mean(ep_rets)) if ep_rets else 0.0
 
 if __name__ == '__main__':
     print(f"Using {device} device")
+    if METAL:
+        print(f"MPS available: {torch.backends.mps.is_available()}")
+        print(f"MPS built: {torch.backends.mps.is_built()}")
+        if device.type == 'mps':
+            print("✅ MPS device active")
+        else:
+            print("⚠️  METAL=1 but device is not MPS")
+    print(f"PyTorch threads: {torch.get_num_threads()}")
     train()
