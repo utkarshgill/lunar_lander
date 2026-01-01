@@ -1,5 +1,6 @@
 import gymnasium as gym
 import numpy as np
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,7 +18,7 @@ num_envs = int(os.getenv('NUM_ENVS', 24))
 # https://gymnasium.farama.org/environments/box2d/lunar_lander/#:~:text=For%20the%20default%20values%20of%20VIEWPORT_W%2C%20VIEWPORT_H%2C%20SCALE%2C%20and%20FPS%2C%20the%20scale%20factors%20equal%3A%20%E2%80%98x%E2%80%99%3A%2010%2C%20%E2%80%98y%E2%80%99%3A%206.666%2C%20%E2%80%98vx%E2%80%99%3A%205%2C%20%E2%80%98vy%E2%80%99%3A%207.5%2C%20%E2%80%98angle%E2%80%99%3A%201%2C%20%E2%80%98angular%20velocity%E2%80%99%3A%202.5
 OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
 
-max_epochs, max_timesteps, steps_per_epoch = 100, 1000, 100_000
+max_epochs, steps_per_epoch = 100, 100_000
 log_interval, eval_interval = 5, 10
 batch_size, K_epochs = 5000, 20
 hidden_dim = 128
@@ -36,20 +37,12 @@ device = torch.device('mps' if METAL and torch.backends.mps.is_available() else 
 OBS_SCALE_T_CPU = torch.tensor(OBS_SCALE, dtype=torch.float32, device='cpu')
 OBS_SCALE_T_DEVICE = torch.tensor(OBS_SCALE, dtype=torch.float32, device=device)
 
-# Reduce CPU thread contention with env stepping (only set once per process)
-try:
-    torch.set_num_threads(1)
-    torch.set_num_interop_threads(1)
-except RuntimeError:
-    pass  # Already set in this process
-
 if PLOT: import matplotlib.pyplot as plt
 
 def make_env(n, render=False):
     render_mode = 'human' if render else None
     return gym.vector.AsyncVectorEnv(
         [lambda: gym.make(env_name, render_mode=render_mode) for _ in range(n)],
-        # context='spawn'  # Explicit multiprocessing context for consistency
     )
 
 def update_plot(ax, returns, threshold):
@@ -59,19 +52,26 @@ def update_plot(ax, returns, threshold):
         ma = np.convolve(returns, np.ones(100)/100, mode='valid')
         ax.plot(range(99, len(returns)), ma, label='100-ep MA', linewidth=2)
     ax.axhline(threshold, color='red', linestyle='--', alpha=0.5, label=f'Solved ({threshold})')
-    ax.legend(); ax.set_xlabel('Episode'); ax.set_ylabel('Return'); plt.pause(0.01)
+    ax.legend()
+    ax.set_xlabel('Episode')
+    ax.set_ylabel('Return')
+    plt.pause(0.01)
 
 def tanh_log_prob(raw_action, dist):
-    # Change of variables for tanh squashing
+    # log π(tanh(x)) = log π(x) - log|det J| for change of variables
     action = torch.tanh(raw_action)
     logp_gaussian = dist.log_prob(raw_action).sum(-1)
     return logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
+
+def track_episode_returns(done_mask, ep_returns, ep_rets):
+    for idx in np.where(done_mask)[0]:
+        ep_returns.append(ep_rets[idx])
+        ep_rets[idx] = 0.0
 
 class ActorCritic(nn.Module):
     def __init__(self, state_dim, action_dim, hidden_dim, actor_layers, critic_layers):
         super(ActorCritic, self).__init__()
         
-        # Actor network (complete, outputs action mean)
         actor = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(actor_layers - 1):
             actor.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
@@ -79,7 +79,6 @@ class ActorCritic(nn.Module):
         self.actor = nn.Sequential(*actor)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         
-        # Critic network (complete, outputs value)
         critic = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(critic_layers - 1):
             critic.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
@@ -94,7 +93,6 @@ class ActorCritic(nn.Module):
     
     @torch.inference_mode()
     def act(self, state, deterministic=False):
-        """CPU-only action selection for rollout (no MPS transfer)"""
         dev = next(self.parameters()).device
         scale = OBS_SCALE_T_CPU if dev.type == 'cpu' else OBS_SCALE_T_DEVICE
         state_tensor = torch.from_numpy(state).to(device=dev, dtype=torch.float32) * scale
@@ -128,38 +126,29 @@ class PPO:
         dist = torch.distributions.Normal(action_means, action_stds)
         action_logprobs = tanh_log_prob(batch_actions, dist)
         ratios = torch.exp(action_logprobs - batch_logprobs)
-        # PPO clipped surrogate objective: L = L_CLIP + c1·L_VF - c2·S[π]
         actor_loss = -torch.min(ratios * batch_advantages, torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * batch_advantages).mean()
         critic_loss = F.mse_loss(state_values.squeeze(-1), batch_returns)
         entropy = dist.entropy().sum(-1).mean()
         return actor_loss + self.vf_coef * critic_loss - self.entropy_coef * entropy
     
     def update(self, obs, raw_act, rew, done):
-        """Single MPS transfer, all computation on device"""
         dev = next(self.actor_critic.parameters()).device
-        
-        # Transfer entire rollout to device ONCE
         T, N = rew.shape
         obs_flat = torch.from_numpy(obs.reshape(-1, state_dim)).to(device=dev, dtype=torch.float32)
         raw_act_flat = torch.from_numpy(raw_act.reshape(-1, action_dim)).to(device=dev, dtype=torch.float32)
         rew_t = torch.from_numpy(rew).to(device=dev, dtype=torch.float32)
         done_t = torch.from_numpy(done).to(device=dev, dtype=torch.float32)
         
-        # Apply OBS_SCALE to match rollout (critical for train/inference consistency)
-        scale = OBS_SCALE_T_DEVICE if dev.type != "cpu" else OBS_SCALE_T_CPU
+        scale = OBS_SCALE_T_CPU if dev.type == 'cpu' else OBS_SCALE_T_DEVICE
         obs_flat = obs_flat * scale
         
         with torch.no_grad():
-            # Batched forward pass for old logprobs and values
             mean, std, val = self.actor_critic(obs_flat)
             dist = torch.distributions.Normal(mean, std)
             old_logprobs = tanh_log_prob(raw_act_flat, dist)
             old_values = val.squeeze(-1).view(T, N)
-            
-            # GAE on device
             advantages, returns = self.compute_advantages(rew_t, old_values, done_t)
         
-        # PPO epochs with tensor-based minibatching
         num_samples = obs_flat.size(0)
         for _ in range(self.K_epochs):
             perm = torch.randperm(num_samples, device=dev)
@@ -174,14 +163,12 @@ class PPO:
                 self.pi_optimizer.step()
                 self.vf_optimizer.step()
 
-def rollout(env, actor_critic, num_steps=None, num_episodes=None):
-    """Preallocated numpy rollout for CPU-only data collection"""
+def rollout(env, actor_critic, num_steps=None, num_episodes=None, deterministic=False):
     assert (num_steps is None) != (num_episodes is None), "Specify exactly one: num_steps or num_episodes"
     
     N = env.num_envs
     
     if num_steps:
-        # Preallocated buffers for fixed-length rollout
         T = num_steps // N
         obs = np.empty((T, N, state_dim), dtype=np.float32)
         raw_act = np.empty((T, N, action_dim), dtype=np.float32)
@@ -193,65 +180,49 @@ def rollout(env, actor_critic, num_steps=None, num_episodes=None):
         
         for t in range(T):
             obs[t] = states
-            actions, raw_actions = actor_critic.act(states)
+            actions, raw_actions = actor_critic.act(states, deterministic=deterministic)
             raw_act[t] = raw_actions
             states, rewards, terminated, truncated, _ = env.step(actions)
             rew[t] = rewards
             d = np.logical_or(terminated, truncated)
             done[t] = d
-            # Note: With autoreset_mode='NextStep' (default), done envs auto-reset
-            # and states already contains the reset observations
             ep_rets += rewards
-            for idx in np.where(d)[0]:
-                ep_returns.append(ep_rets[idx])
-                ep_rets[idx] = 0.0
+            track_episode_returns(d, ep_returns, ep_rets)
         
         return obs, raw_act, rew, done, ep_returns
     else:
-        # Variable-length rollout for eval (list-based)
         states, _ = env.reset()
-        traj_rewards, traj_dones, ep_returns, ep_rets, count = [], [], [], np.zeros(N), 0
+        ep_returns, ep_rets = [], np.zeros(N)
         while True:
-            actions, _ = actor_critic.act(states)
+            actions, _ = actor_critic.act(states, deterministic=deterministic)
             states, rewards, terminated, truncated, _ = env.step(actions)
-            traj_rewards.append(rewards)
             d = np.logical_or(terminated, truncated)
-            traj_dones.append(d)
-            # With autoreset_mode='NextStep', done envs auto-reset
             ep_rets += rewards
-            count += N
-            for idx in np.where(d)[0]:
-                ep_returns.append(ep_rets[idx])
-                ep_rets[idx] = 0.0
+            track_episode_returns(d, ep_returns, ep_rets)
             if len(ep_returns) >= num_episodes:
                 break
-        return traj_rewards, traj_dones, ep_returns
+        return ep_returns
 
 class TrainingContext:
-    """Encapsulates all training state and resources"""
     def __init__(self):
-        # Dual models: CPU for rollout, device (MPS/CUDA) for update
+        # dual models: cpu for rollout, device for update (avoids mps transfer latency)
         self.ac_cpu = ActorCritic(state_dim, action_dim, hidden_dim, actor_layers, critic_layers).to('cpu')
         self.ac_device = ActorCritic(state_dim, action_dim, hidden_dim, actor_layers, critic_layers).to(device)
         self.ppo = PPO(self.ac_device, pi_lr, vf_lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef)
         
-        # Reusable environments
         self.env = make_env(num_envs)
-        self.eval_env = make_env(16)  # Reused for evaluation
-        
+        self.eval_env = make_env(16)
         self.all_episode_returns = []
         self.last_eval = float('-inf')
         self.pbar = trange(max_epochs, desc="Training", unit='epoch')
-        
-        # Timing stats
         self.rollout_times = []
         self.update_times = []
         
         if PLOT:
             plt.ion()
-            self.fig, self.ax = plt.subplots()
+            _, self.ax = plt.subplots()
         else:
-            self.fig, self.ax = None, None
+            self.ax = None
     
     def cleanup(self):
         self.env.close()
@@ -262,18 +233,13 @@ class TrainingContext:
             plt.show()
 
 def train_one_epoch(epoch, ctx):
-    import time
-    
-    # Sync weights from device to CPU for rollout
     ctx.ac_cpu.load_state_dict(ctx.ac_device.state_dict())
     
-    # CPU rollout with timing
     t0 = time.perf_counter()
     obs, raw_act, rew, done, ep_rets = rollout(ctx.env, ctx.ac_cpu, num_steps=steps_per_epoch)
     t1 = time.perf_counter()
     ctx.rollout_times.append(t1 - t0)
     
-    # MPS update with timing
     t0 = time.perf_counter()
     ctx.ppo.update(obs, raw_act, rew, done)
     t1 = time.perf_counter()
@@ -282,16 +248,13 @@ def train_one_epoch(epoch, ctx):
     ctx.all_episode_returns.extend(ep_rets)
     ctx.pbar.update(1)
     
-    # Compute metrics
     train_100 = np.mean(ctx.all_episode_returns[-100:]) if ctx.all_episode_returns else 0.0
     
-    # Evaluation (CPU only, reused env)
     if epoch % eval_interval == 0:
         ctx.last_eval = evaluate_policy(ctx.ac_cpu, env=ctx.eval_env)
         if RENDER:
             evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
     
-    # Logging
     if epoch % log_interval == 0:
         s = ctx.ac_device.log_std.exp().detach().cpu().numpy()
         rollout_ms = np.mean(ctx.rollout_times[-log_interval:]) * 1000
@@ -299,18 +262,16 @@ def train_one_epoch(epoch, ctx):
         total_ms = rollout_ms + update_ms
         ctx.pbar.write(f"Epoch {epoch:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  train_100={train_100:6.1f}  eval={ctx.last_eval:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]  ⏱ {total_ms:.0f}ms (rollout:{rollout_ms:.0f}ms update:{update_ms:.0f}ms)")
     
-    # Plotting
     if PLOT and epoch % (log_interval * 2) == 0:
         update_plot(ctx.ax, ctx.all_episode_returns, solved_threshold)
     
-    # Check if solved
     if train_100 >= solved_threshold:
         ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
         if RENDER:
             evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
-        return True  # Signal to stop training
+        return True
     
-    return False  # Continue training
+    return False
 
 def train():
     ctx = TrainingContext()
@@ -324,16 +285,11 @@ def evaluate_policy(actor_critic, n=16, render=False, num_episodes=None, env=Non
     if env is None:
         env = make_env(1 if render else n, render)
     
-    # Use deterministic policy
-    prev_train = actor_critic.training
-    actor_critic.eval()
-    
     if render and num_episodes:
-        _, _, ep_rets = rollout(env, actor_critic, num_episodes=num_episodes)
+        ep_rets = rollout(env, actor_critic, num_episodes=num_episodes, deterministic=True)
     else:
-        _, _, ep_rets = rollout(env, actor_critic, num_episodes=n)  # Fixed number of episodes for eval
+        ep_rets = rollout(env, actor_critic, num_episodes=n, deterministic=True)
     
-    actor_critic.train(prev_train)
     if close_env:
         env.close()
     return float(np.mean(ep_rets)) if ep_rets else 0.0
