@@ -167,41 +167,33 @@ def rollout(env, actor_critic, num_steps=None, num_episodes=None, deterministic=
     assert (num_steps is None) != (num_episodes is None), "Specify exactly one: num_steps or num_episodes"
     
     N = env.num_envs
+    states, _ = env.reset()
+    ep_returns, ep_rets = [], np.zeros(N)
     
-    if num_steps:
+    collect = num_steps is not None
+    if collect:
         T = num_steps // N
         obs = np.empty((T, N, state_dim), dtype=np.float32)
         raw_act = np.empty((T, N, action_dim), dtype=np.float32)
         rew = np.empty((T, N), dtype=np.float32)
         done = np.empty((T, N), dtype=np.float32)
+    
+    t = 0
+    while True:
+        actions, raw_actions = actor_critic.act(states, deterministic=deterministic)
+        if collect: obs[t], raw_act[t] = states, raw_actions
         
-        states, _ = env.reset()
-        ep_returns, ep_rets = [], np.zeros(N)
+        states, rewards, terminated, truncated, _ = env.step(actions)
+        d = np.logical_or(terminated, truncated)
+        if collect: rew[t], done[t] = rewards, d
         
-        for t in range(T):
-            obs[t] = states
-            actions, raw_actions = actor_critic.act(states, deterministic=deterministic)
-            raw_act[t] = raw_actions
-            states, rewards, terminated, truncated, _ = env.step(actions)
-            rew[t] = rewards
-            d = np.logical_or(terminated, truncated)
-            done[t] = d
-            ep_rets += rewards
-            track_episode_returns(d, ep_returns, ep_rets)
+        ep_rets += rewards
+        track_episode_returns(d, ep_returns, ep_rets)
+        t += 1
         
-        return obs, raw_act, rew, done, ep_returns
-    else:
-        states, _ = env.reset()
-        ep_returns, ep_rets = [], np.zeros(N)
-        while True:
-            actions, _ = actor_critic.act(states, deterministic=deterministic)
-            states, rewards, terminated, truncated, _ = env.step(actions)
-            d = np.logical_or(terminated, truncated)
-            ep_rets += rewards
-            track_episode_returns(d, ep_returns, ep_rets)
-            if len(ep_returns) >= num_episodes:
-                break
-        return ep_returns
+        if (collect and t >= T) or (num_episodes and len(ep_returns) >= num_episodes): break
+    
+    return (obs, raw_act, rew, done, ep_returns) if collect else ep_returns
 
 class TrainingContext:
     def __init__(self):
@@ -252,8 +244,7 @@ def train_one_epoch(epoch, ctx):
     
     if epoch % eval_interval == 0:
         ctx.last_eval = evaluate_policy(ctx.ac_cpu, env=ctx.eval_env)
-        if RENDER:
-            evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
+        if RENDER: evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
     
     if epoch % log_interval == 0:
         s = ctx.ac_device.log_std.exp().detach().cpu().numpy()
@@ -267,8 +258,7 @@ def train_one_epoch(epoch, ctx):
     
     if train_100 >= solved_threshold:
         ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
-        if RENDER:
-            evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
+        if RENDER: evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
         return True
     
     return False
@@ -276,22 +266,14 @@ def train_one_epoch(epoch, ctx):
 def train():
     ctx = TrainingContext()
     for epoch in range(max_epochs):
-        if train_one_epoch(epoch, ctx):
-            break
+        if train_one_epoch(epoch, ctx): break
     ctx.cleanup()
 
-def evaluate_policy(actor_critic, n=16, render=False, num_episodes=None, env=None):
+def evaluate_policy(actor_critic, num_episodes=16, render=False, env=None):
     close_env = env is None
-    if env is None:
-        env = make_env(1 if render else n, render)
-    
-    if render and num_episodes:
-        ep_rets = rollout(env, actor_critic, num_episodes=num_episodes, deterministic=True)
-    else:
-        ep_rets = rollout(env, actor_critic, num_episodes=n, deterministic=True)
-    
-    if close_env:
-        env.close()
+    if env is None: env = make_env(1 if render else num_episodes, render)
+    ep_rets = rollout(env, actor_critic, num_episodes=num_episodes, deterministic=True)
+    if close_env: env.close()
     return float(np.mean(ep_rets)) if ep_rets else 0.0
 
 if __name__ == '__main__':
