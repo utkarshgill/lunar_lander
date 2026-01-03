@@ -37,7 +37,8 @@ device = torch.device('mps' if METAL and torch.backends.mps.is_available() else 
 OBS_SCALE_T_CPU = torch.tensor(OBS_SCALE, dtype=torch.float32, device='cpu')
 OBS_SCALE_T_DEVICE = torch.tensor(OBS_SCALE, dtype=torch.float32, device=device)
 
-if PLOT: import matplotlib.pyplot as plt
+if PLOT:
+    import matplotlib.pyplot as plt
 
 def make_env(n, render=False):
     render_mode = 'human' if render else None
@@ -128,7 +129,13 @@ class PPO:
         ratios = torch.exp(action_logprobs - batch_logprobs)
         actor_loss = -torch.min(ratios * batch_advantages, torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * batch_advantages).mean()
         critic_loss = F.mse_loss(state_values.squeeze(-1), batch_returns)
-        entropy = dist.entropy().sum(-1).mean()
+        
+        # Compute entropy of tanh-transformed distribution: H[tanh(X)] = H[X] - E[log(1 - tanh²(X))]
+        gaussian_entropy = dist.entropy().sum(-1)  # [batch_size]
+        actions_squashed = torch.tanh(batch_actions)
+        jacobian_correction = torch.log(1 - actions_squashed**2 + 1e-6).sum(-1)  # [batch_size]
+        entropy = (gaussian_entropy - jacobian_correction).mean()
+        
         return actor_loss + self.vf_coef * critic_loss - self.entropy_coef * entropy
     
     def update(self, obs, raw_act, rew, done):
@@ -181,17 +188,20 @@ def rollout(env, actor_critic, num_steps=None, num_episodes=None, deterministic=
     t = 0
     while True:
         actions, raw_actions = actor_critic.act(states, deterministic=deterministic)
-        if collect: obs[t], raw_act[t] = states, raw_actions
+        if collect:
+            obs[t], raw_act[t] = states, raw_actions
         
         states, rewards, terminated, truncated, _ = env.step(actions)
         d = np.logical_or(terminated, truncated)
-        if collect: rew[t], done[t] = rewards, d
+        if collect:
+            rew[t], done[t] = rewards, d
         
         ep_rets += rewards
         track_episode_returns(d, ep_returns, ep_rets)
         t += 1
         
-        if (collect and t >= T) or (num_episodes and len(ep_returns) >= num_episodes): break
+        if (collect and t >= T) or (num_episodes and len(ep_returns) >= num_episodes):
+            break
     
     return (obs, raw_act, rew, done, ep_returns) if collect else ep_returns
 
@@ -244,7 +254,8 @@ def train_one_epoch(epoch, ctx):
     
     if epoch % eval_interval == 0:
         ctx.last_eval = evaluate_policy(ctx.ac_cpu, env=ctx.eval_env)
-        if RENDER: evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
+        if RENDER:
+            evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
     
     if epoch % log_interval == 0:
         s = ctx.ac_device.log_std.exp().detach().cpu().numpy()
@@ -258,7 +269,8 @@ def train_one_epoch(epoch, ctx):
     
     if train_100 >= solved_threshold:
         ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
-        if RENDER: evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
+        if RENDER:
+            evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
         return True
     
     return False
@@ -266,14 +278,17 @@ def train_one_epoch(epoch, ctx):
 def train():
     ctx = TrainingContext()
     for epoch in range(max_epochs):
-        if train_one_epoch(epoch, ctx): break
+        if train_one_epoch(epoch, ctx):
+            break
     ctx.cleanup()
 
 def evaluate_policy(actor_critic, num_episodes=16, render=False, env=None):
     close_env = env is None
-    if env is None: env = make_env(1 if render else num_episodes, render)
+    if env is None:
+        env = make_env(1 if render else num_episodes, render)
     ep_rets = rollout(env, actor_critic, num_episodes=num_episodes, deterministic=True)
-    if close_env: env.close()
+    if close_env:
+        env.close()
     return float(np.mean(ep_rets)) if ep_rets else 0.0
 
 if __name__ == '__main__':
