@@ -58,11 +58,6 @@ def update_plot(ax, returns, threshold):
     ax.set_ylabel('Return')
     plt.pause(0.01)
 
-def tanh_log_prob(raw_action, dist):
-    # log π(tanh(x)) = log π(x) - log|det J| for change of variables
-    action = torch.tanh(raw_action)
-    logp_gaussian = dist.log_prob(raw_action).sum(-1)
-    return logp_gaussian - torch.log(1 - action**2 + 1e-6).sum(-1)
 
 def track_episode_returns(done_mask, ep_returns, ep_rets):
     for idx in np.where(done_mask)[0]:
@@ -78,7 +73,7 @@ class ActorCritic(nn.Module):
             actor.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
         actor.append(nn.Linear(hidden_dim, action_dim))
         self.actor = nn.Sequential(*actor)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std = nn.Parameter(torch.full((action_dim,), -0.7))
         
         critic = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(critic_layers - 1):
@@ -98,9 +93,8 @@ class ActorCritic(nn.Module):
         scale = OBS_SCALE_T_CPU if dev.type == 'cpu' else OBS_SCALE_T_DEVICE
         state_tensor = torch.from_numpy(state).to(device=dev, dtype=torch.float32) * scale
         action_mean, action_std, _ = self(state_tensor)
-        raw_action = action_mean if deterministic else torch.distributions.Normal(action_mean, action_std).sample()
-        action = torch.tanh(raw_action)
-        return action.cpu().numpy(), raw_action.cpu().numpy()
+        sample = action_mean if deterministic else torch.distributions.Normal(action_mean, action_std).sample()
+        return sample.clamp(-1, 1).cpu().numpy(), sample.cpu().numpy()
 
 class PPO:
     def __init__(self, actor_critic, pi_lr, vf_lr, gamma, lamda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef):
@@ -125,16 +119,11 @@ class PPO:
     def compute_loss(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
         action_means, action_stds, state_values = self.actor_critic(batch_states)
         dist = torch.distributions.Normal(action_means, action_stds)
-        action_logprobs = tanh_log_prob(batch_actions, dist)
+        action_logprobs = dist.log_prob(batch_actions).sum(-1)
         ratios = torch.exp(action_logprobs - batch_logprobs)
         actor_loss = -torch.min(ratios * batch_advantages, torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * batch_advantages).mean()
         critic_loss = F.mse_loss(state_values.squeeze(-1), batch_returns)
-        
-        # Compute entropy of tanh-transformed distribution: H[tanh(X)] = H[X] - E[log(1 - tanh²(X))]
-        gaussian_entropy = dist.entropy().sum(-1)  # [batch_size]
-        actions_squashed = torch.tanh(batch_actions)
-        jacobian_correction = torch.log(1 - actions_squashed**2 + 1e-6).sum(-1)  # [batch_size]
-        entropy = (gaussian_entropy - jacobian_correction).mean()
+        entropy = dist.entropy().sum(-1).mean()
         
         return actor_loss + self.vf_coef * critic_loss - self.entropy_coef * entropy
     
@@ -152,7 +141,7 @@ class PPO:
         with torch.no_grad():
             mean, std, val = self.actor_critic(obs_flat)
             dist = torch.distributions.Normal(mean, std)
-            old_logprobs = tanh_log_prob(raw_act_flat, dist)
+            old_logprobs = dist.log_prob(raw_act_flat).sum(-1)
             old_values = val.squeeze(-1).view(T, N)
             advantages, returns = self.compute_advantages(rew_t, old_values, done_t)
         
@@ -267,8 +256,8 @@ def train_one_epoch(epoch, ctx):
     if PLOT and epoch % (log_interval * 2) == 0:
         update_plot(ctx.ax, ctx.all_episode_returns, solved_threshold)
     
-    if train_100 >= solved_threshold:
-        ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! train_100={train_100:.1f} ≥ {solved_threshold}\n{'='*60}")
+    if ctx.last_eval >= solved_threshold:
+        ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! eval={ctx.last_eval:.1f} ≥ {solved_threshold}\n{'='*60}")
         if RENDER:
             evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
         return True
