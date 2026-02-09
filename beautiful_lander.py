@@ -71,9 +71,12 @@ class ActorCritic(nn.Module):
         actor = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(actor_layers - 1):
             actor.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
-        actor.append(nn.Linear(hidden_dim, action_dim))
+        actor.append(nn.Linear(hidden_dim, action_dim * 2))
         self.actor = nn.Sequential(*actor)
-        self.log_std = nn.Parameter(torch.full((action_dim,), -0.7))
+        # init log_std head: zero weights + negative bias so σ starts ~0.5
+        final = self.actor[-1]
+        final.weight.data[action_dim:].zero_()
+        final.bias.data[action_dim:].fill_(-2.0)
         
         critic = [nn.Linear(state_dim, hidden_dim), nn.ReLU()]
         for _ in range(critic_layers - 1):
@@ -82,8 +85,9 @@ class ActorCritic(nn.Module):
         self.critic = nn.Sequential(*critic)
 
     def forward(self, state):
-        action_mean = self.actor(state)
-        action_std = self.log_std.exp()
+        actor_out = self.actor(state)
+        action_mean, log_std = actor_out.chunk(2, dim=-1)
+        action_std = log_std.clamp(-5, 2).exp()
         value = self.critic(state)
         return action_mean, action_std, value
     
@@ -93,13 +97,17 @@ class ActorCritic(nn.Module):
         scale = OBS_SCALE_T_CPU if dev.type == 'cpu' else OBS_SCALE_T_DEVICE
         state_tensor = torch.from_numpy(state).to(device=dev, dtype=torch.float32) * scale
         action_mean, action_std, _ = self(state_tensor)
-        sample = action_mean if deterministic else torch.distributions.Normal(action_mean, action_std).sample()
-        return sample.clamp(-1, 1).cpu().numpy(), sample.cpu().numpy()
+        if deterministic:
+            action = torch.tanh(action_mean)
+            return action.cpu().numpy(), action_mean.cpu().numpy()
+        sample = torch.distributions.Normal(action_mean, action_std).sample()
+        action = torch.tanh(sample)
+        return action.cpu().numpy(), sample.cpu().numpy()
 
 class PPO:
     def __init__(self, actor_critic, pi_lr, vf_lr, gamma, lamda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef):
         self.actor_critic = actor_critic
-        self.pi_optimizer = optim.Adam(list(actor_critic.actor.parameters()) + [actor_critic.log_std], lr=pi_lr)
+        self.pi_optimizer = optim.Adam(actor_critic.actor.parameters(), lr=pi_lr)
         self.vf_optimizer = optim.Adam(actor_critic.critic.parameters(), lr=vf_lr)
         self.gamma, self.lamda, self.K_epochs = gamma, lamda, K_epochs
         self.eps_clip, self.batch_size, self.vf_coef, self.entropy_coef = eps_clip, batch_size, vf_coef, entropy_coef
@@ -119,7 +127,7 @@ class PPO:
     def compute_loss(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
         action_means, action_stds, state_values = self.actor_critic(batch_states)
         dist = torch.distributions.Normal(action_means, action_stds)
-        action_logprobs = dist.log_prob(batch_actions).sum(-1)
+        action_logprobs = dist.log_prob(batch_actions).sum(-1) - torch.log(1 - torch.tanh(batch_actions).pow(2) + 1e-6).sum(-1)
         ratios = torch.exp(action_logprobs - batch_logprobs)
         actor_loss = -torch.min(ratios * batch_advantages, torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * batch_advantages).mean()
         critic_loss = F.mse_loss(state_values.squeeze(-1), batch_returns)
@@ -141,7 +149,7 @@ class PPO:
         with torch.no_grad():
             mean, std, val = self.actor_critic(obs_flat)
             dist = torch.distributions.Normal(mean, std)
-            old_logprobs = dist.log_prob(raw_act_flat).sum(-1)
+            old_logprobs = dist.log_prob(raw_act_flat).sum(-1) - torch.log(1 - torch.tanh(raw_act_flat).pow(2) + 1e-6).sum(-1)
             old_values = val.squeeze(-1).view(T, N)
             advantages, returns = self.compute_advantages(rew_t, old_values, done_t)
         
@@ -154,7 +162,7 @@ class PPO:
                 self.vf_optimizer.zero_grad()
                 loss = self.compute_loss(obs_flat[idx], raw_act_flat[idx], old_logprobs[idx], advantages[idx], returns[idx])
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(list(self.actor_critic.actor.parameters()) + [self.actor_critic.log_std], max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(self.actor_critic.actor.parameters(), max_norm=0.5)
                 torch.nn.utils.clip_grad_norm_(self.actor_critic.critic.parameters(), max_norm=0.5)
                 self.pi_optimizer.step()
                 self.vf_optimizer.step()
@@ -202,7 +210,7 @@ class TrainingContext:
         self.ppo = PPO(self.ac_device, pi_lr, vf_lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef)
         
         self.env = make_env(num_envs)
-        self.eval_env = make_env(16)
+        self.eval_env = make_env(100)
         self.all_episode_returns = []
         self.last_eval = float('-inf')
         self.pbar = trange(max_epochs, desc="Training", unit='epoch')
@@ -247,7 +255,9 @@ def train_one_epoch(epoch, ctx):
             evaluate_policy(ctx.ac_cpu, render=True, num_episodes=RENDER_EPISODES)
     
     if epoch % log_interval == 0:
-        s = ctx.ac_device.log_std.exp().detach().cpu().numpy()
+        with torch.no_grad():
+            _, s_t, _ = ctx.ac_device(torch.zeros(1, state_dim, device=device))
+        s = s_t.squeeze().cpu().numpy()
         rollout_ms = np.mean(ctx.rollout_times[-log_interval:]) * 1000
         update_ms = np.mean(ctx.update_times[-log_interval:]) * 1000
         total_ms = rollout_ms + update_ms
@@ -271,7 +281,7 @@ def train():
             break
     ctx.cleanup()
 
-def evaluate_policy(actor_critic, num_episodes=16, render=False, env=None):
+def evaluate_policy(actor_critic, num_episodes=100, render=False, env=None):
     close_env = env is None
     if env is None:
         env = make_env(1 if render else num_episodes, render)
