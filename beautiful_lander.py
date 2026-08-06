@@ -18,9 +18,9 @@ num_envs = int(os.getenv('NUM_ENVS', 100))
 # https://gymnasium.farama.org/environments/box2d/lunar_lander/#:~:text=For%20the%20default%20values%20of%20VIEWPORT_W%2C%20VIEWPORT_H%2C%20SCALE%2C%20and%20FPS%2C%20the%20scale%20factors%20equal%3A%20%E2%80%98x%E2%80%99%3A%2010%2C%20%E2%80%98y%E2%80%99%3A%206.666%2C%20%E2%80%98vx%E2%80%99%3A%205%2C%20%E2%80%98vy%E2%80%99%3A%207.5%2C%20%E2%80%98angle%E2%80%99%3A%201%2C%20%E2%80%98angular%20velocity%E2%80%99%3A%202.5
 OBS_SCALE = np.array([10, 6.666, 5, 7.5, 1, 2.5, 1, 1], dtype=np.float32)
 
-max_epochs, steps_per_epoch = 100, 100_000
+max_epochs, steps_per_epoch = 100, 20_000
 log_interval, eval_interval = 5, 5
-train_window, eval_episodes = 100, 100
+eval_episodes = 100
 batch_size, K_epochs = 10_000, 20
 hidden_dim = 128
 actor_layers, critic_layers = 4, 4
@@ -40,9 +40,10 @@ OBS_SCALE_T = torch.tensor(OBS_SCALE, dtype=torch.float32, device=device)
 if PLOT:
     import matplotlib.pyplot as plt
 
-def make_env(n, render=False):
+def make_env(n, render=False, asynchronous=True):
     render_mode = 'human' if render else None
-    return gym.vector.AsyncVectorEnv(
+    env_class = gym.vector.AsyncVectorEnv if asynchronous else gym.vector.SyncVectorEnv
+    return env_class(
         [lambda: gym.make(env_name, render_mode=render_mode) for _ in range(n)],
     )
 
@@ -202,9 +203,9 @@ class TrainingContext:
         self.ppo = PPO(self.ac, pi_lr, vf_lr, gamma, gae_lambda, K_epochs, eps_clip, batch_size, vf_coef, entropy_coef)
         
         self.env = make_env(num_envs)
-        self.eval_env = make_env(eval_episodes)
+        self.eval_env = make_env(min(num_envs, eval_episodes), asynchronous=False)
         self.all_episode_returns = []
-        self.last_eval = float('-inf')
+        self.last_eval_stochastic = float('-inf')
         self.pbar = trange(max_epochs, desc="Training", unit='epoch')
         self.rollout_times = []
         self.update_times = []
@@ -237,27 +238,27 @@ def train_one_epoch(epoch, ctx):
     ctx.all_episode_returns.extend(ep_rets)
     ctx.pbar.update(1)
     
-    train_100 = np.mean(ctx.all_episode_returns[-train_window:]) if ctx.all_episode_returns else 0.0
-    
     if epoch % eval_interval == 0:
-        ctx.last_eval = evaluate_policy(ctx.ac, env=ctx.eval_env)
+        ctx.last_eval_stochastic = evaluate_policy(
+            ctx.ac, env=ctx.eval_env, deterministic=False
+        )
         if RENDER:
-            evaluate_policy(ctx.ac, render=True, num_episodes=RENDER_EPISODES)
+            evaluate_policy(ctx.ac, render=True, num_episodes=RENDER_EPISODES, deterministic=False)
     
     if epoch % log_interval == 0:
         s = ctx.ac.log_std.clamp(-5, 2).exp().detach().cpu().numpy()
         rollout_ms = np.mean(ctx.rollout_times[-log_interval:]) * 1000
         update_ms = np.mean(ctx.update_times[-log_interval:]) * 1000
         total_ms = rollout_ms + update_ms
-        ctx.pbar.write(f"Epoch {epoch:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  train_100={train_100:6.1f}  eval={ctx.last_eval:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]  ⏱ {total_ms:.0f}ms (rollout:{rollout_ms:.0f}ms update:{update_ms:.0f}ms)")
+        ctx.pbar.write(f"Epoch {epoch:3d}  n_ep={len(ep_rets):3d}  ret={np.mean(ep_rets):7.1f}±{np.std(ep_rets):5.1f}  eval_stoch={ctx.last_eval_stochastic:6.1f}  σ=[{s[0]:.2f} {s[1]:.2f}]  ⏱ {total_ms:.0f}ms (rollout:{rollout_ms:.0f}ms update:{update_ms:.0f}ms)")
     
     if PLOT and epoch % (log_interval * 2) == 0:
         update_plot(ctx.ax, ctx.all_episode_returns, solved_threshold)
     
-    if ctx.last_eval >= solved_threshold:
-        ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! eval={ctx.last_eval:.1f} ≥ {solved_threshold}\n{'='*60}")
+    if ctx.last_eval_stochastic >= solved_threshold:
+        ctx.pbar.write(f"\n{'='*60}\nSOLVED at epoch {epoch}! eval_stoch={ctx.last_eval_stochastic:.1f} ≥ {solved_threshold}\n{'='*60}")
         if RENDER:
-            evaluate_policy(ctx.ac, render=True, num_episodes=RENDER_EPISODES)
+            evaluate_policy(ctx.ac, render=True, num_episodes=RENDER_EPISODES, deterministic=False)
         return True
     
     return False
@@ -269,11 +270,11 @@ def train():
             break
     ctx.cleanup()
 
-def evaluate_policy(actor_critic, num_episodes=eval_episodes, render=False, env=None):
+def evaluate_policy(actor_critic, num_episodes=eval_episodes, render=False, env=None, deterministic=True):
     close_env = env is None
     if env is None:
         env = make_env(1 if render else num_episodes, render)
-    ep_rets = rollout(env, actor_critic, num_episodes=num_episodes, deterministic=True)
+    ep_rets = rollout(env, actor_critic, num_episodes=num_episodes, deterministic=deterministic)
     if close_env:
         env.close()
     return float(np.mean(ep_rets)) if ep_rets else 0.0
