@@ -107,10 +107,20 @@ def run_worker(args, framework, device, process_index):
 
 def summarize(runs):
     summary = {}
+    expected_processes = len({run['process_index'] for run in runs})
     for framework in ('torch', 'tiny'):
         for device in ('cpu', 'metal'):
             key = f'{framework}_{device}'
-            selected = [run for run in runs if run['framework'].startswith(framework) and run['device'].lower() in (device, 'mps')]
+            expected_device = 'mps' if framework == 'torch' and device == 'metal' else device
+            selected = [
+                run for run in runs
+                if run['framework'].startswith(framework)
+                and run['device'].lower() == expected_device
+            ]
+            if len(selected) != expected_processes:
+                raise RuntimeError(
+                    f'{key} has {len(selected)} runs; expected {expected_processes}'
+                )
             summary[key] = {}
             for batch in BATCHES:
                 summary[key][str(batch)] = {
