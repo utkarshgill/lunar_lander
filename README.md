@@ -32,6 +32,17 @@ Tests used float32 on an Apple M4. Each result is the median of five paired fres
 
 The CPU gap is inside or near tinygrad's generated dense matrix kernels. The Metal gap is much smaller.
 
+One complete four-environment training run gave these wall times. Each run stopped when stochastic evaluation reached 200.
+
+| Framework | Device | Training time | Solved epoch | Stochastic score | Mean per epoch |
+|---|---|---:|---:|---:|---:|
+| PyTorch | CPU | 1m 26.5s | 25 | 247.9 | 3.33s |
+| tinygrad | CPU | 11m 48.2s | 25 | 244.0 | 27.24s |
+| PyTorch | Metal | 19m 16.1s | 25 | 216.2 | 44.47s |
+| tinygrad | Metal | 5m 41.6s | 20 | 204.9 | 16.27s |
+
+These are single stochastic training runs, not paired medians. The four runs used Gymnasium 1.1.1 and the same stopping condition.
+
 [Profiling notes and generated kernels](https://utkarshgill.github.io/blog/tinygrad_lander.html)
 
 <img width="1550" height="1126" alt="image" src="https://github.com/user-attachments/assets/0f0bb9ff-f2b3-4ff2-ba2e-f3d56fc4ca32" />

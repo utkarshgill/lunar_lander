@@ -1,0 +1,8 @@
+{
+  "case": "torch_metal",
+  "seconds": 1156.146119875,
+  "exit_code": 0,
+  "solved": true,
+  "solved_epoch": 25,
+  "eval_stoch": 216.2
+}

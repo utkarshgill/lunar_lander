@@ -4,7 +4,8 @@ import time
 import os
 import warnings
 
-os.environ['DEV'] = 'CPU'
+METAL = bool(int(os.getenv('METAL', '0')))
+os.environ['DEV'] = 'METAL' if METAL else 'CPU'
 
 from tinygrad import Tensor, TinyJit, nn, Context
 from tqdm import trange
@@ -32,7 +33,7 @@ PLOT = bool(int(os.getenv('PLOT', '0')))
 RENDER = bool(int(os.getenv('RENDER', '0')))
 RENDER_EPISODES = int(os.getenv('RENDER_EPISODES', '3'))
 
-device = 'CPU'
+device = 'METAL' if METAL else 'CPU'
 LOG_2PI = float(np.log(2.0 * np.pi))
 NORMAL_ENTROPY_CONSTANT = float(0.5 * np.log(2.0 * np.pi * np.e))
 

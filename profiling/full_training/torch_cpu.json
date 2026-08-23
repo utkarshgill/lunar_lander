@@ -1,0 +1,8 @@
+{
+  "case": "torch_cpu",
+  "seconds": 86.531992625,
+  "exit_code": 0,
+  "solved": true,
+  "solved_epoch": 25,
+  "eval_stoch": 247.9
+}
