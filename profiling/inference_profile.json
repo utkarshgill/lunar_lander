@@ -1,0 +1,513 @@
+{
+  "protocol": {
+    "batches": [
+      4,
+      16,
+      64,
+      256,
+      1024
+    ],
+    "warmup": 10,
+    "samples_per_process": 50,
+    "fresh_processes": 3,
+    "rollout_act": "exact stochastic act path including host-device transfer",
+    "matched_act": "actor-only stochastic act path including host-device transfer",
+    "device_actor": "preloaded input and synchronized actor network only"
+  },
+  "summary": {
+    "torch_cpu": {
+      "4": {
+        "rollout_act_ms": 0.84100025,
+        "matched_act_ms": 0.41714599999999996,
+        "device_actor_ms": 0.20340625
+      },
+      "16": {
+        "rollout_act_ms": 0.8421875,
+        "matched_act_ms": 0.46073925000000004,
+        "device_actor_ms": 0.21526075
+      },
+      "64": {
+        "rollout_act_ms": 0.8260099999999999,
+        "matched_act_ms": 0.4371145000000001,
+        "device_actor_ms": 0.22445824999999997
+      },
+      "256": {
+        "rollout_act_ms": 0.90790625,
+        "matched_act_ms": 0.5409269999999999,
+        "device_actor_ms": 0.2679475
+      },
+      "1024": {
+        "rollout_act_ms": 1.0918955,
+        "matched_act_ms": 0.64249975,
+        "device_actor_ms": 0.3635105
+      }
+    },
+    "torch_metal": {
+      "4": {
+        "rollout_act_ms": 1.602229,
+        "matched_act_ms": 0.8669374999999999,
+        "device_actor_ms": 0.4123335
+      },
+      "16": {
+        "rollout_act_ms": 1.7824585,
+        "matched_act_ms": 0.884125,
+        "device_actor_ms": 0.43304149999999997
+      },
+      "64": {
+        "rollout_act_ms": 1.8973125,
+        "matched_act_ms": 0.9496255,
+        "device_actor_ms": 0.44499999999999995
+      },
+      "256": {
+        "rollout_act_ms": 1.722708,
+        "matched_act_ms": 1.039021,
+        "device_actor_ms": 0.538521
+      },
+      "1024": {
+        "rollout_act_ms": 2.3589585,
+        "matched_act_ms": 1.2765835,
+        "device_actor_ms": 0.7699995
+      }
+    },
+    "tiny_cpu": {
+      "4": {
+        "rollout_act_ms": 1.328646,
+        "matched_act_ms": 1.3182085,
+        "device_actor_ms": 0.1588955
+      },
+      "16": {
+        "rollout_act_ms": 1.3763955,
+        "matched_act_ms": 1.3726875,
+        "device_actor_ms": 0.217354
+      },
+      "64": {
+        "rollout_act_ms": 1.4372915000000002,
+        "matched_act_ms": 1.441854,
+        "device_actor_ms": 0.2765835
+      },
+      "256": {
+        "rollout_act_ms": 1.9742085,
+        "matched_act_ms": 1.9545205,
+        "device_actor_ms": 0.7843745
+      },
+      "1024": {
+        "rollout_act_ms": 3.9850835,
+        "matched_act_ms": 3.9842709999999997,
+        "device_actor_ms": 2.8021875
+      }
+    },
+    "tiny_metal": {
+      "4": {
+        "rollout_act_ms": 1.5438960000000002,
+        "matched_act_ms": 1.381146,
+        "device_actor_ms": 0.3183125
+      },
+      "16": {
+        "rollout_act_ms": 1.468,
+        "matched_act_ms": 1.4053335,
+        "device_actor_ms": 0.359042
+      },
+      "64": {
+        "rollout_act_ms": 1.5373329999999998,
+        "matched_act_ms": 1.4637295,
+        "device_actor_ms": 0.39556250000000004
+      },
+      "256": {
+        "rollout_act_ms": 1.6225209999999999,
+        "matched_act_ms": 1.4782085,
+        "device_actor_ms": 0.4164795
+      },
+      "1024": {
+        "rollout_act_ms": 1.828833,
+        "matched_act_ms": 1.7367085,
+        "device_actor_ms": 0.638646
+      }
+    }
+  },
+  "runs": [
+    {
+      "framework": "torch",
+      "device": "cpu",
+      "results": {
+        "4": {
+          "rollout_act_ms": 0.0858545,
+          "matched_act_ms": 0.044,
+          "device_actor_ms": 0.0315625
+        },
+        "16": {
+          "rollout_act_ms": 0.0912705,
+          "matched_act_ms": 0.0501875,
+          "device_actor_ms": 0.0361045
+        },
+        "64": {
+          "rollout_act_ms": 0.120666,
+          "matched_act_ms": 0.06614600000000001,
+          "device_actor_ms": 0.0523545
+        },
+        "256": {
+          "rollout_act_ms": 0.193979,
+          "matched_act_ms": 0.1045625,
+          "device_actor_ms": 0.08306250000000001
+        },
+        "1024": {
+          "rollout_act_ms": 0.5737909999999999,
+          "matched_act_ms": 0.300958,
+          "device_actor_ms": 0.269479
+        }
+      },
+      "process_index": 0
+    },
+    {
+      "framework": "tinygrad",
+      "device": "CPU",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.3242500000000001,
+          "matched_act_ms": 1.3211045000000001,
+          "device_actor_ms": 0.160521
+        },
+        "16": {
+          "rollout_act_ms": 1.3763955,
+          "matched_act_ms": 1.3732915,
+          "device_actor_ms": 0.217354
+        },
+        "64": {
+          "rollout_act_ms": 1.4372915000000002,
+          "matched_act_ms": 1.4432085,
+          "device_actor_ms": 0.2765835
+        },
+        "256": {
+          "rollout_act_ms": 1.9742085,
+          "matched_act_ms": 2.059542,
+          "device_actor_ms": 0.8128329999999999
+        },
+        "1024": {
+          "rollout_act_ms": 4.151166,
+          "matched_act_ms": 4.1650624999999994,
+          "device_actor_ms": 2.840417
+        }
+      },
+      "process_index": 0
+    },
+    {
+      "framework": "torch",
+      "device": "mps",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.7661875,
+          "matched_act_ms": 0.8669374999999999,
+          "device_actor_ms": 0.4123335
+        },
+        "16": {
+          "rollout_act_ms": 1.7824585,
+          "matched_act_ms": 0.884125,
+          "device_actor_ms": 0.43304149999999997
+        },
+        "64": {
+          "rollout_act_ms": 1.8973125,
+          "matched_act_ms": 0.9496255,
+          "device_actor_ms": 0.44499999999999995
+        },
+        "256": {
+          "rollout_act_ms": 1.722708,
+          "matched_act_ms": 0.9772915,
+          "device_actor_ms": 0.538521
+        },
+        "1024": {
+          "rollout_act_ms": 2.3589585,
+          "matched_act_ms": 1.2765835,
+          "device_actor_ms": 0.7699995
+        }
+      },
+      "process_index": 0
+    },
+    {
+      "framework": "tinygrad",
+      "device": "METAL",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.5438960000000002,
+          "matched_act_ms": 1.376625,
+          "device_actor_ms": 0.31443750000000004
+        },
+        "16": {
+          "rollout_act_ms": 1.5296045,
+          "matched_act_ms": 1.402021,
+          "device_actor_ms": 0.36216649999999995
+        },
+        "64": {
+          "rollout_act_ms": 1.5956665,
+          "matched_act_ms": 1.4506875,
+          "device_actor_ms": 0.4090835
+        },
+        "256": {
+          "rollout_act_ms": 1.6225209999999999,
+          "matched_act_ms": 1.4714165000000001,
+          "device_actor_ms": 0.4164795
+        },
+        "1024": {
+          "rollout_act_ms": 1.828833,
+          "matched_act_ms": 1.7243755,
+          "device_actor_ms": 0.6929375
+        }
+      },
+      "process_index": 0
+    },
+    {
+      "framework": "torch",
+      "device": "cpu",
+      "results": {
+        "4": {
+          "rollout_act_ms": 0.08435400000000001,
+          "matched_act_ms": 0.044334,
+          "device_actor_ms": 0.031333
+        },
+        "16": {
+          "rollout_act_ms": 0.08877099999999999,
+          "matched_act_ms": 0.046625,
+          "device_actor_ms": 0.0341875
+        },
+        "64": {
+          "rollout_act_ms": 0.118646,
+          "matched_act_ms": 0.065187,
+          "device_actor_ms": 0.052
+        },
+        "256": {
+          "rollout_act_ms": 0.19424999999999998,
+          "matched_act_ms": 0.103937,
+          "device_actor_ms": 0.083416
+        },
+        "1024": {
+          "rollout_act_ms": 0.526729,
+          "matched_act_ms": 0.28635449999999996,
+          "device_actor_ms": 0.24712499999999998
+        }
+      },
+      "process_index": 1
+    },
+    {
+      "framework": "tinygrad",
+      "device": "CPU",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.3310624999999998,
+          "matched_act_ms": 1.3076665,
+          "device_actor_ms": 0.1588955
+        },
+        "16": {
+          "rollout_act_ms": 1.3791045,
+          "matched_act_ms": 1.3726875,
+          "device_actor_ms": 0.217896
+        },
+        "64": {
+          "rollout_act_ms": 1.443917,
+          "matched_act_ms": 1.441854,
+          "device_actor_ms": 0.2778125
+        },
+        "256": {
+          "rollout_act_ms": 1.976896,
+          "matched_act_ms": 1.9545205,
+          "device_actor_ms": 0.7843745
+        },
+        "1024": {
+          "rollout_act_ms": 3.9828954999999997,
+          "matched_act_ms": 3.9842709999999997,
+          "device_actor_ms": 2.761146
+        }
+      },
+      "process_index": 1
+    },
+    {
+      "framework": "torch",
+      "device": "mps",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.602229,
+          "matched_act_ms": 0.7893125,
+          "device_actor_ms": 0.37522900000000003
+        },
+        "16": {
+          "rollout_act_ms": 1.5931045,
+          "matched_act_ms": 0.871291,
+          "device_actor_ms": 0.394417
+        },
+        "64": {
+          "rollout_act_ms": 1.5313539999999999,
+          "matched_act_ms": 0.8080830000000001,
+          "device_actor_ms": 0.39656199999999997
+        },
+        "256": {
+          "rollout_act_ms": 1.6215625,
+          "matched_act_ms": 1.039021,
+          "device_actor_ms": 0.45247899999999996
+        },
+        "1024": {
+          "rollout_act_ms": 1.6099999999999999,
+          "matched_act_ms": 0.9840415,
+          "device_actor_ms": 0.457542
+        }
+      },
+      "process_index": 1
+    },
+    {
+      "framework": "tinygrad",
+      "device": "METAL",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.5227495,
+          "matched_act_ms": 1.381146,
+          "device_actor_ms": 0.3183125
+        },
+        "16": {
+          "rollout_act_ms": 1.468,
+          "matched_act_ms": 1.4053335,
+          "device_actor_ms": 0.359042
+        },
+        "64": {
+          "rollout_act_ms": 1.496146,
+          "matched_act_ms": 1.470563,
+          "device_actor_ms": 0.389979
+        },
+        "256": {
+          "rollout_act_ms": 1.6242915,
+          "matched_act_ms": 1.4819165,
+          "device_actor_ms": 0.412729
+        },
+        "1024": {
+          "rollout_act_ms": 1.7697289999999999,
+          "matched_act_ms": 1.745979,
+          "device_actor_ms": 0.6286665
+        }
+      },
+      "process_index": 1
+    },
+    {
+      "framework": "torch",
+      "device": "cpu",
+      "results": {
+        "4": {
+          "rollout_act_ms": 0.0845415,
+          "matched_act_ms": 0.0449795,
+          "device_actor_ms": 0.0315835
+        },
+        "16": {
+          "rollout_act_ms": 0.0892085,
+          "matched_act_ms": 0.047042,
+          "device_actor_ms": 0.0345205
+        },
+        "64": {
+          "rollout_act_ms": 0.118417,
+          "matched_act_ms": 0.0643335,
+          "device_actor_ms": 0.051333
+        },
+        "256": {
+          "rollout_act_ms": 0.1886875,
+          "matched_act_ms": 0.102375,
+          "device_actor_ms": 0.08335400000000001
+        },
+        "1024": {
+          "rollout_act_ms": 0.524167,
+          "matched_act_ms": 0.2858125,
+          "device_actor_ms": 0.2416665
+        }
+      },
+      "process_index": 2
+    },
+    {
+      "framework": "tinygrad",
+      "device": "CPU",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.328646,
+          "matched_act_ms": 1.3182085,
+          "device_actor_ms": 0.15752149999999998
+        },
+        "16": {
+          "rollout_act_ms": 1.366896,
+          "matched_act_ms": 1.363167,
+          "device_actor_ms": 0.21552100000000002
+        },
+        "64": {
+          "rollout_act_ms": 1.4329585,
+          "matched_act_ms": 1.4346670000000001,
+          "device_actor_ms": 0.27218699999999996
+        },
+        "256": {
+          "rollout_act_ms": 1.946229,
+          "matched_act_ms": 1.951479,
+          "device_actor_ms": 0.7793125000000001
+        },
+        "1024": {
+          "rollout_act_ms": 3.9850835,
+          "matched_act_ms": 3.9745,
+          "device_actor_ms": 2.8021875
+        }
+      },
+      "process_index": 2
+    },
+    {
+      "framework": "torch",
+      "device": "mps",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.596146,
+          "matched_act_ms": 0.879979,
+          "device_actor_ms": 0.42035449999999996
+        },
+        "16": {
+          "rollout_act_ms": 1.9187295,
+          "matched_act_ms": 0.962125,
+          "device_actor_ms": 0.4644795
+        },
+        "64": {
+          "rollout_act_ms": 2.0660410000000002,
+          "matched_act_ms": 1.0458954999999999,
+          "device_actor_ms": 0.549813
+        },
+        "256": {
+          "rollout_act_ms": 2.0495205,
+          "matched_act_ms": 1.1296665,
+          "device_actor_ms": 0.639896
+        },
+        "1024": {
+          "rollout_act_ms": 2.659375,
+          "matched_act_ms": 1.9478335,
+          "device_actor_ms": 1.163958
+        }
+      },
+      "process_index": 2
+    },
+    {
+      "framework": "tinygrad",
+      "device": "METAL",
+      "results": {
+        "4": {
+          "rollout_act_ms": 1.5693545,
+          "matched_act_ms": 1.3940835,
+          "device_actor_ms": 0.318542
+        },
+        "16": {
+          "rollout_act_ms": 1.4503125,
+          "matched_act_ms": 1.4176250000000001,
+          "device_actor_ms": 0.35660400000000003
+        },
+        "64": {
+          "rollout_act_ms": 1.5373329999999998,
+          "matched_act_ms": 1.4637295,
+          "device_actor_ms": 0.39556250000000004
+        },
+        "256": {
+          "rollout_act_ms": 1.510875,
+          "matched_act_ms": 1.4782085,
+          "device_actor_ms": 0.42058300000000004
+        },
+        "1024": {
+          "rollout_act_ms": 1.8671039999999999,
+          "matched_act_ms": 1.7367085,
+          "device_actor_ms": 0.638646
+        }
+      },
+      "process_index": 2
+    }
+  ]
+}
