@@ -1,0 +1,27 @@
+{
+  "protocol": {
+    "operation": "(10000x128) @ (128x128)",
+    "dtype": "float32",
+    "warmup": 10,
+    "samples_per_process": 30,
+    "fresh_processes": 5,
+    "synchronize_each_sample": true,
+    "tinygrad_commit": "5b60a09ab0a7f20c3426e505251c48cac020d1fa"
+  },
+  "validation": {
+    "matrix_max_abs": 0.0015360576773559842,
+    "passed": true
+  },
+  "torch_mps": {
+    "median_ms": 0.427271,
+    "process_medians_ms": [0.4155835, 0.909354, 0.403604, 0.436958, 0.427271]
+  },
+  "tinygrad_metal": {
+    "median_ms": 0.900167,
+    "process_medians_ms": [0.900167, 1.0711665, 0.4601875, 0.818396, 1.0280835]
+  },
+  "paired_ratio": {
+    "median": 1.8729397333382154,
+    "process_ratios": [2.166031615788403, 1.1779422535118336, 1.1401955877543335, 1.8729397333382154, 2.406162599380721]
+  }
+}

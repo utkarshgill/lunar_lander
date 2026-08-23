@@ -575,6 +575,8 @@ def run_worker(interpreter, script, backend, args, process_index, environment=No
         command.extend(("--event-log", args.event_log))
     if args.bridge_timeout:
         command.extend(("--bridge-timeout", str(args.bridge_timeout)))
+    if args.dump_kernels:
+        command.extend(("--dump-kernels", args.dump_kernels, "--kernel-key", args.kernel_key))
     output = subprocess.check_output(command, text=True, env=environment)
     return json.loads(output)
 
@@ -607,9 +609,11 @@ def summarize(runs, test):
     return summary
 
 
-def validate_runs(runs, test):
-    if any(run["device"].upper().split(":")[0] != "CPU" for run in runs):
-        raise RuntimeError("a worker did not use the CPU device")
+def validate_runs(runs, test, device):
+    expected_devices = {"CPU"} if device.upper() == "CPU" else {"MPS", "METAL"}
+    actual_devices = {run["device"].upper().split(":")[0] for run in runs}
+    if actual_devices != expected_devices:
+        raise RuntimeError(f"worker devices differ: expected {expected_devices}, got {actual_devices}")
 
     if test == "matrices":
         maximum_error = max(
@@ -754,7 +758,7 @@ def controller(args):
             runs.append(result)
             print(f"process {process_index + 1}/{args.processes} {backend} complete", file=sys.stderr)
 
-    validation = validate_runs(runs, args.test)
+    validation = validate_runs(runs, args.test, args.device)
     summary = summarize(runs, args.test)
     report = {
         "protocol": {
