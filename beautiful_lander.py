@@ -94,7 +94,8 @@ class ActorCritic(nn.Module):
     @torch.inference_mode()
     def act(self, state, deterministic=False):
         state_tensor = torch.from_numpy(state).to(device=device, dtype=torch.float32) * OBS_SCALE_T
-        action_mean, action_std, _ = self(state_tensor)
+        action_mean = self.actor(state_tensor)
+        action_std = self.log_std.clamp(-5, 2).exp().expand_as(action_mean)
         if deterministic:
             action = action_mean.clamp(-1, 1)
             return action.cpu().numpy(), action_mean.cpu().numpy()
@@ -119,7 +120,7 @@ class PPO:
             gae = delta + self.gamma * self.lamda * (1 - is_terminals[t]) * gae
             advantages[t] = gae
         returns = advantages + state_values_pad[:-1]
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        advantages = (advantages - advantages.mean()) / (advantages.std(correction=0) + 1e-8)
         return advantages.reshape(-1), returns.reshape(-1)
     
     def compute_loss(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):

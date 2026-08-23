@@ -6,6 +6,8 @@ import warnings
 
 METAL = bool(int(os.getenv('METAL', '0')))
 os.environ['DEV'] = 'METAL' if METAL else 'CPU'
+if not METAL:
+    os.environ.setdefault('BEAM', '1')
 
 from tinygrad import Tensor, TinyJit, nn, Context
 from tqdm import trange
@@ -112,7 +114,6 @@ class ActorCritic:
 
     def refresh_action_std(self):
         self.action_std = np.exp(self.log_std.clip(-5, 2).numpy())
-        self.actor_jit.reset()
 
 
 def normal_log_prob(action_mean, log_std, actions):
