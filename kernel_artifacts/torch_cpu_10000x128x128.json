@@ -1,0 +1,24 @@
+{
+  "framework": "pytorch",
+  "device": "cpu",
+  "operation": "aten::mm",
+  "shape": [
+    [
+      10000,
+      128
+    ],
+    [
+      128,
+      128
+    ]
+  ],
+  "source_available": false,
+  "execution_boundary": [
+    "aten::mm",
+    "structured_mm_out_cpu",
+    "cpublas::gemm",
+    "SGEMM",
+    "cblas_sgemm",
+    "APL_sgemm"
+  ]
+}

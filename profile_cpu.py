@@ -17,6 +17,25 @@ SHAPES = ((4, 128, 128), (10_000, 128, 128), (128, 10_000, 128))
 PPO_BATCH_SIZE = 10_000
 
 
+def emit_event(args, event, **fields):
+    if not args.event_log and not args.torch_tiny_bridge:
+        return
+    import resource
+
+    max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    record = {
+        "event": event,
+        "monotonic_ns": time.perf_counter_ns(),
+        "max_rss_bytes": max_rss if sys.platform == "darwin" else max_rss * 1024,
+        **fields,
+    }
+    line = json.dumps(record, sort_keys=True)
+    print(f"PROFILE_EVENT {line}", file=sys.stderr, flush=True)
+    if args.event_log:
+        with Path(args.event_log).open("a") as output:
+            output.write(line + "\n")
+
+
 def percentile(values, fraction):
     ordered = sorted(values)
     return ordered[round((len(ordered) - 1) * fraction)]
@@ -70,8 +89,13 @@ def measure(operation, synchronize, warmup, samples):
 def torch_worker(args):
     import torch
 
-    torch.set_num_threads(args.threads)
-    torch.set_num_interop_threads(1)
+    if args.torch_tiny_bridge:
+        import extra.torch_backend.backend  # noqa: F401
+
+    torch_device = "tiny" if args.torch_tiny_bridge else "mps" if args.device.upper() in ("MPS", "METAL") else "cpu"
+    if torch_device == "cpu":
+        torch.set_num_threads(args.threads)
+        torch.set_num_interop_threads(1)
     if args.test == "ppo":
         return torch_ppo_worker(args, torch)
 
@@ -80,38 +104,54 @@ def torch_worker(args):
 
     for m, k, n in ordered_shapes:
         left_array, right_array = fixed_matrix(m, k, n)
-        left = torch.from_numpy(left_array)
-        right = torch.from_numpy(right_array)
-        output = torch.empty(m, n, dtype=torch.float32)
+        left = torch.from_numpy(left_array).to(torch_device)
+        right = torch.from_numpy(right_array).to(torch_device)
+        output = torch.empty(m, n, dtype=torch.float32, device=torch_device)
         key = f"{m}x{k}x{n}"
         results[key] = measure(
             lambda: torch.mm(left, right, out=output),
-            lambda: None,
+            torch.mps.synchronize if torch_device == "mps" else lambda: None,
             args.warmup,
             args.samples,
         )
-        results[key]["error"] = error_metrics(output.numpy(), matrix_reference(left_array, right_array))
+        results[key]["error"] = error_metrics(output.cpu().numpy(), matrix_reference(left_array, right_array))
+
+        if args.dump_kernels and key == args.kernel_key:
+            dump_path = Path(args.dump_kernels)
+            dump_path.mkdir(parents=True, exist_ok=True)
+            implementation = {
+                "framework": "pytorch",
+                "device": torch_device,
+                "operation": "aten::mm",
+                "shape": [[m, k], [k, n]],
+                "source_available": False,
+                "execution_boundary": (
+                    ["aten::mm", "structured_mm_out_cpu", "cpublas::gemm", "SGEMM", "cblas_sgemm", "APL_sgemm"]
+                    if torch_device == "cpu" else ["aten::mm", "aten::mm_out_mps_impl", "MPSGraph"]
+                ),
+            }
+            (dump_path / f"torch_{torch_device}_{key}.json").write_text(json.dumps(implementation, indent=2) + "\n")
 
     return {
         "backend": "torch",
         "version": torch.__version__,
-        "device": "cpu",
+        "device": torch_device,
         "threads": args.threads,
         "process_index": args.process_index,
         "results": results,
     }
 
 
-def fixed_batch():
+def fixed_batch(size=PPO_BATCH_SIZE):
     import numpy as np
 
     random = np.random.default_rng(0)
     return {
-        "states": random.standard_normal((PPO_BATCH_SIZE, 8), dtype=np.float32),
-        "actions": random.standard_normal((PPO_BATCH_SIZE, 2), dtype=np.float32),
-        "old_logprobs": random.standard_normal(PPO_BATCH_SIZE, dtype=np.float32),
-        "advantages": random.standard_normal(PPO_BATCH_SIZE, dtype=np.float32),
-        "returns": random.standard_normal(PPO_BATCH_SIZE, dtype=np.float32),
+        "states": random.standard_normal((size, 8), dtype=np.float32),
+        "actions": random.standard_normal((size, 2), dtype=np.float32),
+        "old_logprobs": random.standard_normal(size, dtype=np.float32),
+        "advantages": random.standard_normal(size, dtype=np.float32),
+        "returns": random.standard_normal(size, dtype=np.float32),
     }
 
 
@@ -134,7 +174,7 @@ def fixed_parameters():
 
 
 def torch_parameter_metrics(parameters):
-    values = [parameter.detach().double().reshape(-1) for parameter in parameters]
+    values = [parameter.detach().cpu().double().reshape(-1) for parameter in parameters]
     return {
         "sum": float(sum(value.sum() for value in values)),
         "sumsq": float(sum((value * value).sum() for value in values)),
@@ -185,27 +225,43 @@ def torch_ppo_worker(args, torch):
         def forward(self, states):
             return self.actor(states), self.log_std.clamp(-5, 2), self.critic(states)
 
-    model = ActorCritic()
+    torch_device = torch.device("tiny") if args.torch_tiny_bridge else torch.device("cpu")
+    emit_event(
+        args, "model_create_start", device=str(torch_device), batch_size=args.ppo_batch_size,
+        torch_version=torch.__version__, python_version=sys.version.split()[0],
+    )
+    model = ActorCritic().to(torch_device)
+    emit_event(args, "model_create_complete")
     parameters = fixed_parameters()
     with torch.no_grad():
         for module, (weight, bias) in zip((layer for layer in model.actor if isinstance(layer, nn.Linear)), parameters["actor"]):
-            module.weight.copy_(torch.from_numpy(weight))
-            module.bias.copy_(torch.from_numpy(bias))
+            module.weight.copy_(torch.from_numpy(weight).to(torch_device))
+            module.bias.copy_(torch.from_numpy(bias).to(torch_device))
         for module, (weight, bias) in zip((layer for layer in model.critic if isinstance(layer, nn.Linear)), parameters["critic"]):
-            module.weight.copy_(torch.from_numpy(weight))
-            module.bias.copy_(torch.from_numpy(bias))
+            module.weight.copy_(torch.from_numpy(weight).to(torch_device))
+            module.bias.copy_(torch.from_numpy(bias).to(torch_device))
     actor_parameters = list(model.actor.parameters()) + [model.log_std]
     critic_parameters = list(model.critic.parameters())
     actor_optimizer = torch.optim.Adam(actor_parameters, lr=1e-3)
     critic_optimizer = torch.optim.Adam(critic_parameters, lr=1e-3)
-    batch = {name: torch.from_numpy(value) for name, value in fixed_batch().items()}
+    emit_event(args, "optimizer_create_complete")
+    batch = {name: torch.from_numpy(value).to(torch_device) for name, value in fixed_batch(args.ppo_batch_size).items()}
+    emit_event(args, "batch_create_complete")
     log_2pi = float(__import__("math").log(2.0 * __import__("math").pi))
     entropy_constant = float(0.5 * __import__("math").log(2.0 * __import__("math").pi * __import__("math").e))
 
+    step_index = 0
+
     def train_step():
+        nonlocal step_index
+        current_step = step_index
+        step_index += 1
+        emit_event(args, "step_start", step=current_step)
         actor_optimizer.zero_grad()
         critic_optimizer.zero_grad()
+        emit_event(args, "zero_grad_complete", step=current_step)
         means, log_std, values = model(batch["states"])
+        emit_event(args, "forward_complete", step=current_step)
         normalized = (batch["actions"] - means) / log_std.exp()
         logprobs = (-0.5 * (normalized.square() + 2.0 * log_std + log_2pi)).sum(dim=-1)
         ratios = (logprobs - batch["old_logprobs"]).exp()
@@ -215,35 +271,74 @@ def torch_ppo_worker(args, torch):
         critic_loss = functional.mse_loss(values.squeeze(-1), batch["returns"])
         entropy = (log_std + entropy_constant).sum()
         loss = actor_loss + critic_loss - 0.001 * entropy
+        emit_event(args, "loss_graph_complete", step=current_step)
         loss.backward()
+        emit_event(args, "backward_complete", step=current_step)
         torch.nn.utils.clip_grad_norm_(actor_parameters, max_norm=0.5)
         torch.nn.utils.clip_grad_norm_(critic_parameters, max_norm=0.5)
+        emit_event(args, "clip_complete", step=current_step)
         actor_optimizer.step()
         critic_optimizer.step()
+        emit_event(args, "optimizer_step_complete", step=current_step)
         return loss
 
+    def realize_bridge_step(loss):
+        if not args.torch_tiny_bridge:
+            return
+        import signal
+        from extra.torch_backend.backend import unwrap
+
+        def timeout_handler(_signum, _frame):
+            raise TimeoutError(f"bridge realization exceeded {args.bridge_timeout} seconds")
+
+        emit_event(args, "realize_start", step=step_index - 1)
+        previous_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        if args.bridge_timeout:
+            signal.setitimer(signal.ITIMER_REAL, args.bridge_timeout)
+        try:
+            loss.detach().item()
+            for parameter in actor_parameters + critic_parameters:
+                unwrap(parameter).realize()
+        except TimeoutError:
+            import traceback
+            emit_event(
+                args, "realize_timeout", step=step_index - 1, timeout_seconds=args.bridge_timeout,
+                traceback=traceback.format_exc(),
+            )
+            raise
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+        emit_event(args, "realize_complete", step=step_index - 1)
+
     initial_ms, initial_losses = [], []
-    for _ in range(3):
+    for _ in range(args.initial_steps):
         start = time.perf_counter_ns()
         loss = train_step()
+        realize_bridge_step(loss)
         initial_ms.append((time.perf_counter_ns() - start) / 1e6)
         initial_losses.append(float(loss.detach()))
     validation = {
         "initial_losses": initial_losses,
         "parameters_after_initial": torch_parameter_metrics(actor_parameters + critic_parameters),
         "parameter_values_after_initial": encode_parameters(
-            [parameter.detach().numpy() for parameter in actor_parameters + critic_parameters]
+            [parameter.detach().cpu().numpy() for parameter in actor_parameters + critic_parameters]
         ),
     }
-    result = measure(train_step, lambda: None, args.warmup, args.samples)
+    def measured_step():
+        loss = train_step()
+        realize_bridge_step(loss)
+        return loss
+
+    result = measure(measured_step, lambda: None, args.warmup, args.samples)
     result["initial_ms"] = initial_ms
     validation["parameter_values_after_measurement"] = encode_parameters(
-        [parameter.detach().numpy() for parameter in actor_parameters + critic_parameters]
+        [parameter.detach().cpu().numpy() for parameter in actor_parameters + critic_parameters]
     )
     return {
         "backend": "torch",
         "version": torch.__version__,
-        "device": "cpu",
+        "device": "tiny:0" if args.torch_tiny_bridge else "cpu",
         "threads": args.threads,
         "process_index": args.process_index,
         "results": {"ppo_step": result},
@@ -294,6 +389,23 @@ def tiny_worker(args):
             wait=True,
         )
         results[key]["direct_kernel_ms"] = GlobalCounters.time_sum_s * 1e3
+        if args.dump_kernels and key == args.kernel_key:
+            dump_path = Path(args.dump_kernels)
+            dump_path.mkdir(parents=True, exist_ok=True)
+            program = matmul.captured.linear.src[0].src[0]
+            source = Device[Device.DEFAULT].renderer.render(program.src[0].toposort())
+            suffix = "metal" if str(Device.DEFAULT).upper().startswith("METAL") else "c"
+            (dump_path / f"tiny_{str(Device.DEFAULT).lower()}_{key}.{suffix}").write_text(source)
+            metadata = {
+                "framework": "tinygrad",
+                "device": str(Device.DEFAULT),
+                "name": program.arg.name,
+                "shape": [[m, k], [k, n]],
+                "global_size": program.arg.global_size,
+                "local_size": program.arg.local_size,
+                "target": str(program.arg.target),
+            }
+            (dump_path / f"tiny_{str(Device.DEFAULT).lower()}_{key}.json").write_text(json.dumps(metadata, indent=2) + "\n")
         results[key]["initial_ms"] = capture_ms
         actual = matmul(left, right).numpy()
         results[key]["error"] = error_metrics(actual, matrix_reference(left_array, right_array))
@@ -356,7 +468,7 @@ def tiny_ppo_worker(args, Device, Tensor, TinyJit):
         nn.optim.Adam(actor_parameters, lr=1e-3),
         nn.optim.Adam(critic_parameters, lr=1e-3),
     )
-    batch = {name: Tensor(value).realize() for name, value in fixed_batch().items()}
+    batch = {name: Tensor(value).realize() for name, value in fixed_batch(args.ppo_batch_size).items()}
     log_2pi = float(__import__("math").log(2.0 * __import__("math").pi))
     entropy_constant = float(0.5 * __import__("math").log(2.0 * __import__("math").pi * __import__("math").e))
 
@@ -386,7 +498,7 @@ def tiny_ppo_worker(args, Device, Tensor, TinyJit):
         )
 
     initial_ms, initial_losses = [], []
-    for _ in range(3):
+    for _ in range(args.initial_steps):
         start = time.perf_counter_ns()
         loss = operation()
         Device[Device.DEFAULT].synchronize()
@@ -452,9 +564,17 @@ def run_worker(interpreter, script, backend, args, process_index, environment=No
         "--samples", str(args.samples),
         "--process-index", str(process_index),
         "--device", args.device,
+        "--ppo-batch-size", str(args.ppo_batch_size),
+        "--initial-steps", str(args.initial_steps),
     ]
     if args.hcq2 if hcq2 is None else hcq2:
         command.append("--hcq2")
+    if args.torch_tiny_bridge and backend == "torch":
+        command.append("--torch-tiny-bridge")
+    if args.event_log:
+        command.extend(("--event-log", args.event_log))
+    if args.bridge_timeout:
+        command.extend(("--bridge-timeout", str(args.bridge_timeout)))
     output = subprocess.check_output(command, text=True, env=environment)
     return json.loads(output)
 
@@ -680,6 +800,13 @@ def parse_args():
     parser.add_argument("--hcq2", action="store_true")
     parser.add_argument("--compare-hcq2", action="store_true")
     parser.add_argument("--cooldown", type=float, default=0.0)
+    parser.add_argument("--dump-kernels")
+    parser.add_argument("--kernel-key", default="10000x128x128")
+    parser.add_argument("--torch-tiny-bridge", action="store_true")
+    parser.add_argument("--ppo-batch-size", type=int, default=PPO_BATCH_SIZE)
+    parser.add_argument("--event-log")
+    parser.add_argument("--initial-steps", type=int, default=3)
+    parser.add_argument("--bridge-timeout", type=float, default=0.0)
     return parser.parse_args()
 
 

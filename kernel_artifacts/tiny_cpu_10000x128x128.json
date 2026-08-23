@@ -1,0 +1,26 @@
+{
+  "framework": "tinygrad",
+  "device": "CPU",
+  "name": "r_2500_32_4_4_32_4",
+  "shape": [
+    [
+      10000,
+      128
+    ],
+    [
+      128,
+      128
+    ]
+  ],
+  "global_size": [
+    1,
+    1,
+    1
+  ],
+  "local_size": [
+    1,
+    1,
+    1
+  ],
+  "target": "CPU::arm64,native"
+}

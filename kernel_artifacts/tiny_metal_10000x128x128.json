@@ -1,0 +1,26 @@
+{
+  "framework": "tinygrad",
+  "device": "METAL",
+  "name": "r_250_32_4_2_5_4_16",
+  "shape": [
+    [
+      10000,
+      128
+    ],
+    [
+      128,
+      128
+    ]
+  ],
+  "global_size": [
+    250,
+    1,
+    1
+  ],
+  "local_size": [
+    32,
+    4,
+    1
+  ],
+  "target": "METAL::Apple9"
+}

@@ -1,0 +1,21 @@
+{
+  "framework": "pytorch",
+  "device": "mps",
+  "operation": "aten::mm",
+  "shape": [
+    [
+      10000,
+      128
+    ],
+    [
+      128,
+      128
+    ]
+  ],
+  "source_available": false,
+  "execution_boundary": [
+    "aten::mm",
+    "aten::mm_out_mps_impl",
+    "MPSGraph"
+  ]
+}
