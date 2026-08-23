@@ -166,6 +166,18 @@ class PPO:
         entropy = (log_std + NORMAL_ENTROPY_CONSTANT).sum()
         return actor_loss + self.vf_coef * critic_loss - self.entropy_coef * entropy
 
+    @TinyJit
+    @Context(TRAINING=1)
+    def train_step(self, batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns):
+        self.optimizer.zero_grad()
+        loss = self.compute_loss(
+            batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns
+        )
+        loss.backward()
+        clip_grad_norm(self.actor_parameters, 0.5)
+        clip_grad_norm(self.critic_parameters, 0.5)
+        return loss.realize(*self.optimizer.schedule_step())
+
     def update(self, obs, raw_act, rew, done):
         T, N = rew.shape
         obs_np = obs.reshape(-1, state_dim).astype(np.float32) * OBS_SCALE
@@ -183,19 +195,18 @@ class PPO:
         returns = Tensor(returns_np, device=device)
         num_samples = obs_flat.shape[0]
 
-        with Context(TRAINING=1):
-            for _ in range(self.K_epochs):
-                permutation = np.random.permutation(num_samples).astype(np.int32)
-                for start in range(0, num_samples, self.batch_size):
-                    idx = Tensor(permutation[start:start + self.batch_size], device=device)
-                    self.optimizer.zero_grad()
-                    loss = self.compute_loss(
-                        obs_flat[idx], raw_act_flat[idx], old_logprobs[idx], advantages[idx], returns[idx]
-                    )
-                    loss.backward()
-                    clip_grad_norm(self.actor_parameters, 0.5)
-                    clip_grad_norm(self.critic_parameters, 0.5)
-                    self.optimizer.step()
+        for _ in range(self.K_epochs):
+            permutation = np.random.permutation(num_samples).astype(np.int32)
+            for start in range(0, num_samples, self.batch_size):
+                idx = Tensor(permutation[start:start + self.batch_size], device=device)
+                batch_states = obs_flat[idx].contiguous().realize()
+                batch_actions = raw_act_flat[idx].contiguous().realize()
+                batch_logprobs = old_logprobs[idx].contiguous().realize()
+                batch_advantages = advantages[idx].contiguous().realize()
+                batch_returns = returns[idx].contiguous().realize()
+                self.train_step(
+                    batch_states, batch_actions, batch_logprobs, batch_advantages, batch_returns
+                )
         self.actor_critic.refresh_action_std()
 
 
