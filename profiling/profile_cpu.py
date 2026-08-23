@@ -3,6 +3,8 @@
 
 import argparse
 import base64
+from collections import Counter
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -404,6 +406,7 @@ def tiny_worker(args):
                 "global_size": program.arg.global_size,
                 "local_size": program.arg.local_size,
                 "target": str(program.arg.target),
+                "applied_opts": [str(opt) for opt in program.src[0].arg.applied_opts],
             }
             (dump_path / f"tiny_{str(Device.DEFAULT).lower()}_{key}.json").write_text(json.dumps(metadata, indent=2) + "\n")
         results[key]["initial_ms"] = capture_ms
@@ -471,6 +474,7 @@ def tiny_ppo_worker(args, Device, Tensor, TinyJit):
     batch = {name: Tensor(value).realize() for name, value in fixed_batch(args.ppo_batch_size).items()}
     log_2pi = float(__import__("math").log(2.0 * __import__("math").pi))
     entropy_constant = float(0.5 * __import__("math").log(2.0 * __import__("math").pi * __import__("math").e))
+    lazy_graph_summary = {}
 
     @TinyJit
     @Context(TRAINING=1)
@@ -489,7 +493,18 @@ def tiny_ppo_worker(args, Device, Tensor, TinyJit):
         loss.backward()
         clip_grad_norm(actor_parameters, 0.5)
         clip_grad_norm(critic_parameters, 0.5)
-        return loss.realize(*optimizer.schedule_step())
+        updates = optimizer.schedule_step()
+        if args.dump_pipeline and not lazy_graph_summary:
+            nodes = loss.uop.sink(*[update.uop for update in updates]).toposort()
+            lazy_graph_summary.update({
+                "node_count": len(nodes),
+                "operation_counts": dict(sorted(Counter(node.op.name for node in nodes).items())),
+                "output_count": 1 + len(updates),
+                "output_shapes": dict(sorted(Counter(
+                    f"{tensor.dtype}:{tuple(tensor.shape)}" for tensor in (loss, *updates)
+                ).items())),
+            })
+        return loss.realize(*updates)
 
     def operation():
         return train_step(
@@ -538,6 +553,8 @@ def tiny_ppo_worker(args, Device, Tensor, TinyJit):
     validation["parameter_values_after_measurement"] = encode_parameters(final_parameter_values)
     captured = train_step.captured
     result["graph_calls"] = len(captured.linear.src) if captured is not None else None
+    if args.dump_pipeline and captured is not None:
+        dump_tiny_pipeline(captured.linear, lazy_graph_summary, Path(args.dump_pipeline), Device)
     return {
         "backend": "tiny",
         "device": str(Device.DEFAULT),
@@ -547,6 +564,77 @@ def tiny_ppo_worker(args, Device, Tensor, TinyJit):
         "results": {"ppo_step": result},
         "validation": validation,
     }
+
+
+def dump_tiny_pipeline(linear, lazy_graph_summary, destination, Device):
+    destination.mkdir(parents=True, exist_ok=True)
+    source_directory = destination / "sources"
+    source_directory.mkdir(exist_ok=True)
+    calls, sources = [], {}
+    for index, call in enumerate(linear.src):
+        program = call.src[0]
+        if program.op.name != "PROGRAM":
+            calls.append({"index": index, "operation": program.op.name})
+            continue
+        kernel = program.src[0]
+        source = Device[Device.DEFAULT].renderer.render(kernel.toposort())
+        source_hash = hashlib.sha256(source.encode()).hexdigest()[:12]
+        source_name = f"{program.arg.function_name}_{source_hash}.c"
+        if source_hash not in sources:
+            (source_directory / source_name).write_text(source)
+            sources[source_hash] = {
+                "file": f"sources/{source_name}",
+                "name": program.arg.function_name,
+                "applied_opts": [str(opt) for opt in kernel.arg.applied_opts],
+                "uops": len(program.src[1].src),
+            }
+        arguments = []
+        for argument in call.src[1:]:
+            arguments.append({
+                "operation": argument.op.name,
+                "dtype": str(argument.dtype),
+                "shape": [str(value) for value in argument.shape],
+                "device": str(argument.device),
+                "tag": str(argument.tag) if argument.tag is not None else None,
+            })
+        calls.append({
+            "index": index,
+            "operation": "PROGRAM",
+            "name": program.arg.function_name,
+            "source": f"sources/{source_name}",
+            "source_hash": source_hash,
+            "global_size": list(program.arg.global_size),
+            "local_size": list(program.arg.local_size) if program.arg.local_size is not None else None,
+            "input_slots": list(program.arg.ins),
+            "output_slots": list(program.arg.outs),
+            "arguments": arguments,
+        })
+    family_counts = {}
+    for call in calls:
+        if "name" in call:
+            family_counts[call["name"]] = family_counts.get(call["name"], 0) + 1
+    report = {
+        "device": str(Device.DEFAULT),
+        "lazy_graph": lazy_graph_summary,
+        "call_count": len(calls),
+        "unique_program_count": len(sources),
+        "program_families": dict(sorted(family_counts.items(), key=lambda item: (-item[1], item[0]))),
+        "sources": list(sources.values()),
+        "calls": calls,
+    }
+    (destination / "pipeline.json").write_text(json.dumps(report, indent=2) + "\n")
+    (destination / "README.md").write_text(
+        "# tinygrad PPO pipeline trace\n\n"
+        "This trace comes from the controlled 10,000-sample PPO update on CPU with `BEAM=1`.\n\n"
+        f"The lazy loss and optimizer graph contains {lazy_graph_summary['node_count']} UOps and "
+        f"{lazy_graph_summary['output_count']} requested outputs. Realization produces {len(calls)} program calls "
+        f"from {len(sources)} unique rendered programs.\n\n"
+        "`pipeline.json` lists calls in TinyJit replay order. Each call records its buffer shapes, output slots, "
+        "input slots, launch size, source file, and source hash. Each source entry records the applied schedule options.\n\n"
+        "The first two calls are the actor and critic input layers. Their generated program fuses the matrix product "
+        "and bias addition. Later calls implement hidden layers, PPO loss, backward operations, gradient clipping, "
+        "and Adam state updates.\n"
+    )
 
 
 def git_commit(path):
@@ -809,6 +897,7 @@ def parse_args():
     parser.add_argument("--torch-tiny-bridge", action="store_true")
     parser.add_argument("--ppo-batch-size", type=int, default=PPO_BATCH_SIZE)
     parser.add_argument("--event-log")
+    parser.add_argument("--dump-pipeline")
     parser.add_argument("--initial-steps", type=int, default=3)
     parser.add_argument("--bridge-timeout", type=float, default=0.0)
     return parser.parse_args()
