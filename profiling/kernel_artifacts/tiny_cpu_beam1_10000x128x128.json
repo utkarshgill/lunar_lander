@@ -1,0 +1,14 @@
+{
+  "framework": "tinygrad",
+  "device": "CPU",
+  "name": "r_2000_8_5_4_4_128",
+  "shape": [[10000, 128], [128, 128]],
+  "global_size": [1, 1, 1],
+  "local_size": [1, 1, 1],
+  "target": "CPU::arm64,native",
+  "applied_opts": [
+    "Opt(op=OptOps.UPCAST, axis=0, arg=5)",
+    "Opt(op=OptOps.UPCAST, axis=1, arg=4)",
+    "Opt(op=OptOps.UPCAST, axis=1, arg=4)"
+  ]
+}

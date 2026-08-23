@@ -7,6 +7,7 @@
 #include <time.h>
 
 #include "kernel_artifacts/tiny_cpu_10000x128x128.c"
+#include "kernel_artifacts/tiny_cpu_beam1_10000x128x128.c"
 
 enum { M = 10000, K = 128, N = 128, WARMUP = 10, SAMPLES = 50 };
 
@@ -44,9 +45,14 @@ static void run_tiny(float *output, const float *left, const float *right) {
   r_2500_32_4_4_32_4(output, (float *)left, (float *)right);
 }
 
+static void run_tiny_beam(float *output, const float *left, const float *right) {
+  r_2000_8_5_4_4_128(output, (float *)left, (float *)right);
+}
+
 int main(int argc, char **argv) {
-  if (argc != 2 || (strcmp(argv[1], "cblas") && strcmp(argv[1], "cblas_column") && strcmp(argv[1], "tiny"))) {
-    fprintf(stderr, "usage: %s cblas|cblas_column|tiny\n", argv[0]);
+  if (argc != 2 || (strcmp(argv[1], "cblas") && strcmp(argv[1], "cblas_column") &&
+                    strcmp(argv[1], "tiny") && strcmp(argv[1], "tiny_beam"))) {
+    fprintf(stderr, "usage: %s cblas|cblas_column|tiny|tiny_beam\n", argv[0]);
     return 2;
   }
   float *left = NULL, *right = NULL, *output = NULL, *reference = NULL;
@@ -60,6 +66,7 @@ int main(int argc, char **argv) {
   void (*operation)(float *, const float *, const float *) = run_tiny;
   if (!strcmp(argv[1], "cblas")) operation = run_cblas;
   if (!strcmp(argv[1], "cblas_column")) operation = run_cblas_column;
+  if (!strcmp(argv[1], "tiny_beam")) operation = run_tiny_beam;
   operation(output, left, right);
 
   double max_abs = 0.0, sum_square = 0.0;
