@@ -18,4 +18,20 @@ python -m pip install "tinygrad @ git+https://github.com/tinygrad/tinygrad.git@9
 NUM_ENVS=4 python beautiful_lander_tiny.py
 ```
 
+## performance
+
+Both four-environment trainers solved Lunar Lander with stochastic evaluation.
+
+Tests used float32 on an Apple M4. Each result is the median of five paired fresh processes.
+
+| Test | PyTorch | tinygrad | Ratio |
+|---|---:|---:|---:|
+| Complete CPU PPO update | 10.582 ms | 234.562 ms | 22.1× |
+| CPU `(10000×128) @ (128×128)` | 0.2260 ms | 6.2470 ms | 27.7× |
+| Metal `(10000×128) @ (128×128)` | 0.4273 ms | 0.9002 ms | 1.87× |
+
+The CPU gap is inside or near tinygrad's generated dense matrix kernels. The Metal gap is much smaller.
+
+[Profiling notes and generated kernels](https://utkarshgill.github.io/blog/tinygrad_lander.html)
+
 <img width="1550" height="1126" alt="image" src="https://github.com/user-attachments/assets/0f0bb9ff-f2b3-4ff2-ba2e-f3d56fc4ca32" />
