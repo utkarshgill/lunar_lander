@@ -43,6 +43,8 @@ One complete four-environment training run gave these wall times. Each run stopp
 
 These are single stochastic training runs, not paired medians. The four runs used Gymnasium 1.1.1 and the same stopping condition.
 
+The PyTorch rollout also computes the unused critic. See [`profiling/inference_profile.json`](profiling/inference_profile.json) for the matched actor-only comparison.
+
 [Profiling notes and generated kernels](https://utkarshgill.github.io/blog/tinygrad_lander.html)
 
 <img width="1550" height="1126" alt="image" src="https://github.com/user-attachments/assets/0f0bb9ff-f2b3-4ff2-ba2e-f3d56fc4ca32" />
